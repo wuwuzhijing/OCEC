@@ -1,6 +1,15 @@
 # OCEC
 open closed eyes classification
 
+|Variant|Size|F1|CPU<br>inference<br>latency|ONNX|
+|:-:|:-:|:-:|:-:|:-:|
+|P|112 KB||0.18 ms|[Download]()|
+|N|176 KB||0.31 ms|[Download]()|
+|S|494 KB|0.9939|0.50 ms|[Download]()|
+|C|875 KB||0.60 ms|[Download]()|
+|M|1.7 MB||0.70 ms|[Download]()|
+|L|6.4 MB||0.91 ms|[Download]()|
+
 ```bash
 uv run python 01_dataset_viewer.py --split train
 uv run python 01_dataset_viewer.py --split train --visualize
@@ -171,6 +180,24 @@ uv run python -m ocec train \
   ```bash
   tensorboard --logdir runs/ocec
   ```
+
+### ONNX Export
+
+```bash
+uv run python -m ocec exportonnx \
+--checkpoint runs/ocec_is_s/vsdlm_best_epoch0049_f1_0.9939.pt \
+--output runs/vsdlm/ocec_s.onnx \
+--opset 17
+
+uv run python -m ocec webcam_onnx \
+--model vsdlm.onnx \
+--camera_index 0 \
+--provider cuda \
+--detector_provider tensorrt
+```
+
+- The saved graph exposes `images` as input and `prob_open` as output (batch dimension is dynamic); probabilities can be consumed directly.
+- After exporting, the tool runs `onnxsim` for simplification and rewrites any remaining BatchNormalization nodes into affine `Mul`/`Add` primitives. If simplification fails, a warning is emitted and the unsimplified model is preserved.
 
 ## Acknowledgements
 - https://huggingface.co/datasets/MichalMlodawski/closed-open-eyes
