@@ -186,7 +186,7 @@ uv run python -m ocec train \
 ```bash
 uv run python -m ocec exportonnx \
 --checkpoint runs/ocec_is_s/vsdlm_best_epoch0049_f1_0.9939.pt \
---output runs/vsdlm/ocec_s.onnx \
+--output ocec_s.onnx \
 --opset 17
 
 uv run python -m ocec webcam_onnx \
