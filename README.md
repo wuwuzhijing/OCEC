@@ -113,7 +113,7 @@ uv run python -m ocec train \
 --batch_size 256 \
 --train_ratio 0.8 \
 --val_ratio 0.2 \
---image_size 30x48 \
+--image_size 24x40 \
 --base_channels 32 \
 --num_blocks 4 \
 --arch_variant baseline \
@@ -132,7 +132,7 @@ uv run python -m ocec train \
 --batch_size 256 \
 --train_ratio 0.8 \
 --val_ratio 0.2 \
---image_size 30x48 \
+--image_size 24x40 \
 --base_channels 32 \
 --num_blocks 4 \
 --arch_variant inverted_se \
@@ -152,7 +152,7 @@ uv run python -m ocec train \
 --batch_size 256 \
 --train_ratio 0.8 \
 --val_ratio 0.2 \
---image_size 30x48 \
+--image_size 24x40 \
 --base_channels 32 \
 --num_blocks 4 \
 --arch_variant convnext \
