@@ -144,7 +144,7 @@ Rows are stratified within each label before concatenation, so both splits keep 
 - Every augmented image that originates from the same `still_image` stays in the same split to prevent leakage.
 - The training loop relies on `BCEWithLogitsLoss`, `pos_weight`, and a `WeightedRandomSampler` to stabilise optimisation under class imbalance; inference produces sigmoid probabilities.
 - Training history, validation metrics, optional test predictions, checkpoints, configuration JSON, and ONNX exports are produced automatically.
-- Per-epoch checkpoints named like `ocec_epoch_0001.pt` are retained (latest 10), as well as the best checkpoints named `ocec_best_epoch0004_f10.9321.pt` (also latest 10).
+- Per-epoch checkpoints named like `ocec_epoch_0001.pt` are retained (latest 10), as well as the best checkpoints named `ocec_best_epoch0004_f1_0.9321.pt` (also latest 10).
 - The backbone can be switched with `--arch_variant`. Supported combinations with `--head_variant` are:
 
   | `--arch_variant` | Default (`--head_variant auto`) | Explicitly selectable heads | Remarks |
@@ -217,7 +217,7 @@ uv run python -m ocec train \
 --use_amp
 ```
 
-- Outputs include the latest 10 `ocec_epoch_*.pt`, the latest 10 `ocec_best_epochXXXX_f1YYYY.pt` (highest validation F1, or training F1 when no validation split), `history.json`, `summary.json`, optional `test_predictions.csv`, and `train.log`.
+- Outputs include the latest 10 `ocec_epoch_*.pt`, the latest 10 `ocec_best_epochXXXX_f1_YYYY.pt` (highest validation F1, or training F1 when no validation split), `history.json`, `summary.json`, optional `test_predictions.csv`, and `train.log`.
 - After every epoch a confusion matrix and ROC curve are saved under `runs/ocec/diagnostics/<split>/confusion_<split>_epochXXXX.png` and `roc_<split>_epochXXXX.png`.
 - `--image_size` accepts either a single integer for square crops (e.g. `--image_size 48`) or `HEIGHTxWIDTH` to resize non-square frames (e.g. `--image_size 64x48`).
 - Add `--resume <checkpoint>` to continue from an earlier epoch. Remember that `--epochs` indicates the desired total epoch count (e.g. resuming `--epochs 40` after training to epoch 30 will run 10 additional epochs).
