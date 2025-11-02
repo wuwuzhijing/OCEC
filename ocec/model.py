@@ -323,7 +323,7 @@ class _TokenMixerHead(nn.Module):
         return logits
 
 
-class VSDLM(nn.Module):
+class OCEC(nn.Module):
     """Compact mouth state classifier that outputs logits."""
 
     def __init__(self, config: Optional[ModelConfig] = None) -> None:

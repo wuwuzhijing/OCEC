@@ -37,7 +37,7 @@ from .data import (
     create_dataloader,
     split_samples,
 )
-from .model import VSDLM, ModelConfig
+from .model import OCEC, ModelConfig
 
 LOGGER = logging.getLogger("ocec")
 
@@ -804,7 +804,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         token_mixer_grid=config.token_mixer_grid,
         token_mixer_layers=config.token_mixer_layers,
     )
-    model = VSDLM(model_config).to(device)
+    model = OCEC(model_config).to(device)
     base_metadata = {
         "model_config": asdict(model_config),
         "train_config": train_config_serialized,
@@ -1017,9 +1017,9 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
         }
-        epoch_path = config.output_dir / f"vsdlm_epoch_{epoch:04d}.pt"
+        epoch_path = config.output_dir / f"ocec_epoch_{epoch:04d}.pt"
         torch.save(epoch_payload, epoch_path)
-        _prune_checkpoints(config.output_dir, "vsdlm_epoch_", 10)
+        _prune_checkpoints(config.output_dir, "ocec_epoch_", 10)
 
         current_val_loss = val_metrics["loss"] if val_metrics else train_metrics["loss"]
         score_value = val_metrics["f1"] if val_metrics else train_metrics["f1"]
@@ -1046,10 +1046,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 best_accuracy=accuracy_value,
                 best_f1=score_value,
             )
-            best_checkpoint_path = config.output_dir / f"vsdlm_best_epoch{epoch:04d}_f1_{score_value:.4f}.pt"
+            best_checkpoint_path = config.output_dir / f"ocec_best_epoch{epoch:04d}_f1_{score_value:.4f}.pt"
             best_state["checkpoint_path"] = str(best_checkpoint_path)
             torch.save(best_checkpoint, best_checkpoint_path)
-            _prune_checkpoints(config.output_dir, "vsdlm_best_", 10)
+            _prune_checkpoints(config.output_dir, "ocec_best_", 10)
             LOGGER.info("New best model at epoch %d (F1 %.4f).", epoch, score_value)
 
     if best_state is None or best_checkpoint_path is None:
@@ -1133,7 +1133,7 @@ def predict_images(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model_config = ModelConfig(**checkpoint["model_config"])
-    model = VSDLM(model_config).to(device)
+    model = OCEC(model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -1181,7 +1181,7 @@ def run_webcam_inference(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model_config = ModelConfig(**checkpoint["model_config"])
-    model = VSDLM(model_config).to(device)
+    model = OCEC(model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -1504,7 +1504,7 @@ def export_to_onnx(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model_config = ModelConfig(**checkpoint["model_config"])
-    model = VSDLM(model_config).to(device)
+    model = OCEC(model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 

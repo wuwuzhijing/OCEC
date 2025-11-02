@@ -184,12 +184,12 @@ uv run python -m ocec train \
 
 ```bash
 uv run python -m ocec exportonnx \
---checkpoint runs/ocec_is_s/vsdlm_best_epoch0049_f1_0.9939.pt \
+--checkpoint runs/ocec_is_s/ocec_best_epoch0049_f1_0.9939.pt \
 --output ocec_s.onnx \
 --opset 17
 
 uv run python -m ocec webcam_onnx \
---model vsdlm.onnx \
+--model ocec.onnx \
 --camera_index 0 \
 --provider cuda \
 --detector_provider tensorrt

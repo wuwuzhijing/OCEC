@@ -1,6 +1,6 @@
 """OCEC: Open and closed eye classification pipeline."""
 
-from .model import VSDLM
+from .model import OCEC
 from .pipeline import main
 
-__all__ = ["VSDLM", "main"]
+__all__ = ["OCEC", "main"]
