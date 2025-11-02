@@ -238,6 +238,23 @@ uv run python -m ocec webcam_onnx \
 - The saved graph exposes `images` as input and `prob_open` as output (batch dimension is dynamic); probabilities can be consumed directly.
 - After exporting, the tool runs `onnxsim` for simplification and rewrites any remaining BatchNormalization nodes into affine `Mul`/`Add` primitives. If simplification fails, a warning is emitted and the unsimplified model is preserved.
 
+## Citation
+
+If you find this project useful, please consider citing:
+
+```bibtex
+@software{hyodo2025ocec,
+  author    = {Katsuya Hyodo},
+  title     = {PINTO0309/OCEC},
+  month     = {10},
+  year      = {2025},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.17494543},
+  url       = {https://github.com/PINTO0309/ocec},
+  abstract  = {Open closed eyes classification. Ultra-fast wink and blink estimation model.},
+}
+```
+
 ## Acknowledgements
 - https://huggingface.co/datasets/MichalMlodawski/closed-open-eyes
   ```bibtex
