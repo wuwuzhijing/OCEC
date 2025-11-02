@@ -1,5 +1,5 @@
 # OCEC
-open closed eyes classification
+Open closed eyes classification. Ultra-fast wink and blink estimation model.
 
 https://github.com/user-attachments/assets/2ae9467f-a67f-447e-8704-d16efacdacf1
 
