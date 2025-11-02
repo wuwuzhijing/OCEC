@@ -23,13 +23,13 @@ source .venv/bin/activate
 uv run python demo_ocec.py \
 -v 0 \
 -m deimv2_dinov3_s_wholebody34_1750query_n_batch_640x640.onnx \
--vm ocec_l.onnx \
+-om ocec_l.onnx \
 -ep cuda
 
 uv run python demo_ocec.py \
 -v 0 \
 -m deimv2_dinov3_s_wholebody34_1750query_n_batch_640x640.onnx \
--vm ocec_l.onnx \
+-om ocec_l.onnx \
 -ep tensorrt
 ```
 
