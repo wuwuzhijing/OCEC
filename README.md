@@ -108,6 +108,9 @@ uv run python 03_wholebody34_data_extractor.py \
 #     open: 135319
 ```
 
+<img width="500" alt="open_eye_size_hist" src="https://github.com/user-attachments/assets/27044072-bb82-4a3e-8d2b-6be942a73dc7" />
+<img width="500" alt="closed_eye_size_hist" src="https://github.com/user-attachments/assets/eb5c07d6-bb27-4ac3-a7e1-cdc595c93e01" />
+
 ```bash
 uv run python 04_dataset_convert_to_parquet.py \
 --annotation data/cropped/annotation.csv \
