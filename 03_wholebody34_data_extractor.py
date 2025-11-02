@@ -1715,10 +1715,27 @@ def main():
         if not image_dirs_for_analysis and not video_paths_for_analysis:
             default_dir = Path('data') / 'extracted' / 'train'
             image_dirs_for_analysis.append(default_dir)
-            default_videos = [
-                Path('real_data') / 'open.mp4',
-                Path('real_data') / 'closed.mp4',
-            ]
+            real_data_dir = Path('real_data')
+            default_videos: List[Path] = []
+            if real_data_dir.exists():
+                def _video_sort_key(path: Path) -> Tuple[str, int]:
+                    stem = path.stem
+                    prefix = stem.rstrip('0123456789')
+                    suffix = stem[len(prefix):]
+                    number = int(suffix) if suffix else 0
+                    return prefix, number
+
+                for pattern in ('open*.mp4', 'closed*.mp4'):
+                    matched_paths = [
+                        candidate for candidate in real_data_dir.glob(pattern)
+                        if candidate.is_file()
+                    ]
+                    default_videos.extend(sorted(matched_paths, key=_video_sort_key))
+            if not default_videos:
+                default_videos = [
+                    real_data_dir / 'open.mp4',
+                    real_data_dir / 'closed.mp4',
+                ]
             video_paths_for_analysis.extend(default_videos)
 
         # Deduplicate while preserving order
