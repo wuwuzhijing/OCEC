@@ -267,3 +267,4 @@ If you find this project useful, please consider citing:
     url = {https://huggingface.co/datasets/MichalMlodawski/closed-open-eyes},
   }
   ```
+- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/472_DEIMv2-Wholebody34 - Apache 2.0
