@@ -1026,10 +1026,10 @@ def load_label_from_json(image_path: Path) -> Optional[Tuple[str, int]]:
 
 def resolve_video_label(video_path: Path) -> Optional[Tuple[str, int]]:
     stem = video_path.stem.lower()
-    if 'open' in stem:
-        return 'open', 0
     if 'closed' in stem:
-        return 'closed', 1
+        return 'closed', 0
+    if 'open' in stem:
+        return 'open', 1
     return None
 
 
