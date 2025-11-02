@@ -92,6 +92,15 @@ uv run python 03_wholebody34_data_extractor.py \
 #   Crops per label:
 #     closed: 134522
 #     open: 110796
+
+# Eye-only detection summary
+#   Total images: 130793
+#   Images with detection: 130438
+#   Images without detection: 355
+#   Images with >=3 detections: 1201
+#   Crops per label:
+#     closed: 136331
+#     open: 111864
 ```
 
 ```bash
