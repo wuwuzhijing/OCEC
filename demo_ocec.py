@@ -1441,10 +1441,10 @@ def main():
             eye_crop = crop_image_with_margin(
                 image=image,
                 box=box,
-                margin_top=2,
-                margin_bottom=6,
-                margin_left=2,
-                margin_right=2,
+                margin_top=0,
+                margin_bottom=0,
+                margin_left=0,
+                margin_right=0,
             )
             if eye_crop is None or eye_crop.size == 0:
                 continue
@@ -1454,7 +1454,7 @@ def main():
             except Exception:
                 continue
             box.eye_prob_open = prob_open
-            box.eye_state = 1 if prob_open >= 0.5 else 0
+            box.eye_state = 1 if prob_open >= 0.50 else 0
             state_text = 'Open' if box.eye_state == 1 else 'Closed'
             box.eye_label = state_text
 
