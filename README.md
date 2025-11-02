@@ -6,8 +6,9 @@ open closed eyes classification
 |P|112 KB||0.16 ms|[Download]()|
 |N|176 KB||0.25 ms|[Download]()|
 |S|494 KB||0.41 ms|[Download]()|
+|C|875 KB|||[Download]()|
 |M|1.7 MB||0.57 ms|[Download]()|
-|L|6.4 MB|0.9940|0.80 ms|[Download]()|
+|L|6.4 MB|0.9954|0.80 ms|[Download]()|
 
 ## Setup
 
