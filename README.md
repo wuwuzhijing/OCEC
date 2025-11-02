@@ -238,6 +238,11 @@ uv run python -m ocec webcam_onnx \
 - The saved graph exposes `images` as input and `prob_open` as output (batch dimension is dynamic); probabilities can be consumed directly.
 - After exporting, the tool runs `onnxsim` for simplification and rewrites any remaining BatchNormalization nodes into affine `Mul`/`Add` primitives. If simplification fails, a warning is emitted and the unsimplified model is preserved.
 
+## Arch
+
+<img width="300" alt="ocec_p" src="https://github.com/user-attachments/assets/fa54cf38-0fd4-487a-bf9e-dfbc5401a389" />
+
+
 ## Citation
 
 If you find this project useful, please consider citing:
