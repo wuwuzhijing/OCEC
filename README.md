@@ -249,6 +249,11 @@ uv run python -m ocec exportonnx \
 
 <img width="300" alt="ocec_p" src="https://github.com/user-attachments/assets/fa54cf38-0fd4-487a-bf9e-dfbc5401a389" />
 
+## Ultra-lightweight classification model series
+1. [VSDLM: Visual-only speech detection driven by lip movements](https://github.com/PINTO0309/VSDLM) - MIT License
+2. [OCEC: Open closed eyes classification. Ultra-fast wink and blink estimation model](https://github.com/PINTO0309/OCEC) - MIT License
+3. [PGC: Ultrafast pointing gesture classification](https://github.com/PINTO0309/PGC) - MIT License
+4. [SC: Ultrafast sitting classification](https://github.com/PINTO0309/SC) - MIT License
 
 ## Citation
 
