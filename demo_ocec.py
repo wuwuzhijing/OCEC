@@ -1394,8 +1394,17 @@ def main():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+            # Generate output filename with input video name as suffix
+            if is_parsable_to_int(video):
+                # Camera index, use default name
+                output_filename = 'output.mp4'
+            else:
+                # Video file, extract name without extension
+                video_path = Path(video)
+                video_stem = video_path.stem  # filename without extension
+                output_filename = f'output_{video_stem}.mp4'
             video_writer = cv2.VideoWriter(
-                filename='output.mp4',
+                filename=output_filename,
                 fourcc=fourcc,
                 fps=cap_fps,
                 frameSize=(w, h),
@@ -1883,39 +1892,39 @@ def main():
         if video_writer is not None:
             video_writer.write(debug_image)
             # video_writer.write(image)
+        else:
+            cv2.imshow("test", debug_image)
 
-        cv2.imshow("test", debug_image)
-
-        key = cv2.waitKey(1) & 0xFF if file_paths is None or disable_waitKey else cv2.waitKey(0) & 0xFF
-        if key == ord('\x1b'): # 27, ESC
-            break
-        elif key == ord('b'): # 98, B, Bone drawing mode switch
-            enable_bone_drawing_mode = not enable_bone_drawing_mode
-        elif key == ord('n'): # 110, N, Generation mode switch
-            disable_generation_identification_mode = not disable_generation_identification_mode
-        elif key == ord('g'): # 103, G, Gender mode switch
-            disable_gender_identification_mode = not disable_gender_identification_mode
-        elif key == ord('p'): # 112, P, HeadPose mode switch
-            disable_headpose_identification_mode = not disable_headpose_identification_mode
-        elif key == ord('h'): # 104, H, HandsLR mode switch
-            disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
-        elif key == ord('k'): # 107, K, Keypoints mode switch
-            if keypoint_drawing_mode == 'dot':
-                keypoint_drawing_mode = 'box'
-            elif keypoint_drawing_mode == 'box':
-                keypoint_drawing_mode = 'both'
-            elif keypoint_drawing_mode == 'both':
-                keypoint_drawing_mode = 'dot'
-        elif key == ord('r'): # 114, R, Tracking mode switch
-            enable_tracking = not enable_tracking
-            if enable_tracking and not enable_trackid_overlay:
-                enable_trackid_overlay = True
-        elif key == ord('t'): # 116, T, TrackID overlay mode switch
-            enable_trackid_overlay = not enable_trackid_overlay
-            if not enable_tracking:
-                enable_trackid_overlay = False
-        elif key == ord('m'): # 109, M, Head distance measurement mode switch
-            enable_head_distance_measurement = not enable_head_distance_measurement
+            key = cv2.waitKey(1) & 0xFF if file_paths is None or disable_waitKey else cv2.waitKey(0) & 0xFF
+            if key == ord('\x1b'): # 27, ESC
+                break
+            elif key == ord('b'): # 98, B, Bone drawing mode switch
+                enable_bone_drawing_mode = not enable_bone_drawing_mode
+            elif key == ord('n'): # 110, N, Generation mode switch
+                disable_generation_identification_mode = not disable_generation_identification_mode
+            elif key == ord('g'): # 103, G, Gender mode switch
+                disable_gender_identification_mode = not disable_gender_identification_mode
+            elif key == ord('p'): # 112, P, HeadPose mode switch
+                disable_headpose_identification_mode = not disable_headpose_identification_mode
+            elif key == ord('h'): # 104, H, HandsLR mode switch
+                disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
+            elif key == ord('k'): # 107, K, Keypoints mode switch
+                if keypoint_drawing_mode == 'dot':
+                    keypoint_drawing_mode = 'box'
+                elif keypoint_drawing_mode == 'box':
+                    keypoint_drawing_mode = 'both'
+                elif keypoint_drawing_mode == 'both':
+                    keypoint_drawing_mode = 'dot'
+            elif key == ord('r'): # 114, R, Tracking mode switch
+                enable_tracking = not enable_tracking
+                if enable_tracking and not enable_trackid_overlay:
+                    enable_trackid_overlay = True
+            elif key == ord('t'): # 116, T, TrackID overlay mode switch
+                enable_trackid_overlay = not enable_trackid_overlay
+                if not enable_tracking:
+                    enable_trackid_overlay = False
+            elif key == ord('m'): # 109, M, Head distance measurement mode switch
+                enable_head_distance_measurement = not enable_head_distance_measurement
 
     if video_writer is not None:
         video_writer.release()

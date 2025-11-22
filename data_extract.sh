@@ -1,0 +1,1 @@
+nohup python 03_wholebody34_data_extractor.py -ea -j 4 -ep cuda > logs/data_extract_$(date +%Y%m%d_%H%M%S).log 2>&1 &

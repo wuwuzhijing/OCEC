@@ -21,6 +21,22 @@ import importlib.util
 from collections import Counter, defaultdict
 from abc import ABC, abstractmethod
 import matplotlib
+from multiprocessing import Pool, cpu_count, current_process, Manager, Lock, set_start_method
+from functools import partial
+import hashlib
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # Color not defined yet, use plain print
+    print('Warning: tqdm not installed. Install with: pip install tqdm')
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    # fcntl is not available on Windows
+    HAS_FCNTL = False
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -292,7 +308,8 @@ class AbstractModel(ABC):
         self._obj_class_score_th = obj_class_score_th
         self._attr_class_score_th = attr_class_score_th
         self._keypoint_th = keypoint_th
-        self._providers = providers
+        self._providers = providers  # Keep original configured providers
+        self._configured_providers = providers  # Explicitly save configured providers
 
         # Model loading
         if self._runtime == 'onnx':
@@ -306,9 +323,17 @@ class AbstractModel(ABC):
                     sess_options=session_option,
                     providers=providers,
                 )
-            self._providers = self._interpreter.get_providers()
-            print(f'{Color.GREEN("Enabled ONNX ExecutionProviders:")}')
-            pprint(f'{self._providers}')
+            # Get actual available providers (may differ from configured)
+            actual_providers = self._interpreter.get_providers()
+            # Only print in main process to avoid spam in multiprocessing
+            if current_process().name == 'MainProcess':
+                print(f'{Color.GREEN("Configured ONNX ExecutionProviders:")}')
+                pprint(f'{self._configured_providers}')
+                print(f'{Color.GREEN("Actually enabled ONNX ExecutionProviders:")}')
+                pprint(f'{actual_providers}')
+                if set(actual_providers) != set([p if isinstance(p, str) else p[0] for p in self._configured_providers]):
+                    print(Color.YELLOW('WARNING: Some configured providers are not available!'))
+                    print(Color.YELLOW('This may cause issues in worker processes.'))
 
             self._input_names = [
                 input.name for input in self._interpreter.get_inputs()
@@ -471,11 +496,10 @@ class DEIMv2(AbstractModel):
         result_boxes: List[Box]
             Predicted boxes: [classid, score, x1, y1, x2, y2, cx, cy, atrributes, is_used=False]
         """
-        temp_image = copy.deepcopy(image)
-        # PreProcess
+        # PreProcess (no need to deepcopy if preprocessing doesn't modify original)
         resized_image = \
             self._preprocess(
-                temp_image,
+                image,
             )
         # Inference
         inferece_image = np.asarray([resized_image], dtype=self._input_dtypes[0])
@@ -484,7 +508,7 @@ class DEIMv2(AbstractModel):
         # PostProcess
         result_boxes = \
             self._postprocess(
-                image=temp_image,
+                image=image,
                 boxes=boxes,
                 disable_generation_identification_mode=disable_generation_identification_mode,
                 disable_gender_identification_mode=disable_gender_identification_mode,
@@ -866,7 +890,7 @@ class CropIndexer:
 class EyeAnalysisTracker:
     """Collect statistics and artifacts for eye-only analysis."""
 
-    def __init__(self, output_root: Path) -> None:
+    def __init__(self, output_root: Path, csv_max_entries: int = 12000) -> None:
         self.output_root = Path(output_root)
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.total_images = 0
@@ -876,6 +900,9 @@ class EyeAnalysisTracker:
         self.widths_by_label: Dict[str, List[int]] = defaultdict(list)
         self.crops_per_label: Counter = Counter()
         self.annotation_entries: List[Tuple[str, int]] = []
+        self.csv_max_entries = csv_max_entries
+        self.current_csv_index = 1
+        self.current_csv_entries = 0
 
     @property
     def images_without_eye(self) -> int:
@@ -904,30 +931,180 @@ class EyeAnalysisTracker:
             self.widths_by_label[label_name].append(width_px)
         self.crops_per_label[label_name] += 1
 
-    def write_annotation_csv(self) -> None:
-        annotation_path = self.output_root / 'annotation.csv'
+    def _get_current_csv_path(self) -> Path:
+        """Get the current CSV file path based on index."""
+        return self.output_root / f'annotation_{self.current_csv_index:04d}.csv'
+    
+    def _get_all_csv_paths(self) -> List[Path]:
+        """Get all existing annotation CSV file paths."""
+        csv_files = sorted(self.output_root.glob('annotation_*.csv'))
+        return csv_files
+    
+    def _load_all_existing_entries(self) -> Dict[str, int]:
+        """Load all entries from existing CSV files."""
         merged_entries: Dict[str, int] = {}
-        if annotation_path.exists():
-            with open(annotation_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if ',' not in line:
-                        continue
-                    rel_path, classid_str = line.split(',', 1)
-                    rel_path = rel_path.strip()
-                    classid_str = classid_str.strip()
+        csv_files = self._get_all_csv_paths()
+        
+        for csv_path in csv_files:
+            if not csv_path.exists():
+                continue
+            try:
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or ',' not in line:
+                            continue
+                        rel_path, classid_str = line.split(',', 1)
+                        rel_path = rel_path.strip()
+                        classid_str = classid_str.strip()
+                        try:
+                            merged_entries[rel_path] = int(classid_str)
+                        except ValueError:
+                            continue
+            except (OSError, IOError) as e:
+                print(Color.YELLOW(f'Warning: Error reading {csv_path}: {e}'))
+        
+        return merged_entries
+    
+    def _find_next_csv_index(self) -> int:
+        """Find the next available CSV file index."""
+        csv_files = self._get_all_csv_paths()
+        if not csv_files:
+            return 1
+        
+        # Extract index from the last CSV file
+        last_csv = csv_files[-1]
+        try:
+            # Format: annotation_0001.csv
+            stem = last_csv.stem  # annotation_0001
+            index_str = stem.split('_')[-1]
+            last_index = int(index_str)
+            
+            # Check if last CSV is full
+            with open(last_csv, 'r', encoding='utf-8') as f:
+                line_count = sum(1 for _ in f)
+            
+            if line_count >= self.csv_max_entries:
+                return last_index + 1
+            else:
+                return last_index
+        except (ValueError, OSError):
+            return 1
+    
+    def write_annotation_csv(self, lock: Optional[Lock] = None, force_flush: bool = False) -> None:
+        """Write annotation CSV with optional file lock for multiprocessing safety.
+        
+        Writes entries to CSV files, creating new files when current file reaches max_entries.
+        """
+        if not self.annotation_entries:
+            return
+        
+        # Use file lock for multiprocessing safety
+        def _write_with_lock():
+            # Load all existing entries to check for duplicates
+            existing_entries = self._load_all_existing_entries()
+            
+            # Filter out duplicates
+            new_entries: List[Tuple[str, int]] = []
+            for rel_path, classid in self.annotation_entries:
+                if rel_path not in existing_entries:
+                    new_entries.append((rel_path, classid))
+                    existing_entries[rel_path] = classid
+            
+            if not new_entries:
+                self.annotation_entries = []
+                return
+            
+            # Find the current CSV index and how many entries it has
+            self.current_csv_index = self._find_next_csv_index()
+            current_csv_path = self._get_current_csv_path()
+            
+            # Load current CSV if it exists
+            current_csv_entries: Dict[str, int] = {}
+            if current_csv_path.exists():
+                try:
+                    with open(current_csv_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or ',' not in line:
+                                continue
+                            rel_path, classid_str = line.split(',', 1)
+                            rel_path = rel_path.strip()
+                            classid_str = classid_str.strip()
+                            try:
+                                current_csv_entries[rel_path] = int(classid_str)
+                            except ValueError:
+                                continue
+                except (OSError, IOError):
+                    pass
+            
+            # Write entries, creating new CSV files as needed
+            remaining_new_entries = new_entries.copy()
+            
+            while remaining_new_entries:
+                # Check if current CSV is full
+                if len(current_csv_entries) >= self.csv_max_entries:
+                    # Save current CSV
+                    sorted_entries = sorted(current_csv_entries.items(), key=lambda item: item[0])
                     try:
-                        merged_entries[rel_path] = int(classid_str)
-                    except ValueError:
-                        continue
-        for rel_path, classid in self.annotation_entries:
-            merged_entries[rel_path] = classid
-        sorted_entries = sorted(merged_entries.items(), key=lambda item: item[0])
-        with open(annotation_path, 'w', encoding='utf-8') as f:
-            for rel_path, classid in sorted_entries:
-                f.write(f'{rel_path},{classid}\n')
+                        with open(current_csv_path, 'w', encoding='utf-8') as f:
+                            for rel_path, classid in sorted_entries:
+                                f.write(f'{rel_path},{classid}\n')
+                        print(Color.GREEN(f'Saved {len(sorted_entries)} entries to {current_csv_path.name}'))
+                    except (OSError, IOError) as e:
+                        print(Color.RED(f'Error writing {current_csv_path}: {e}'))
+                    
+                    # Move to next CSV
+                    self.current_csv_index += 1
+                    current_csv_path = self._get_current_csv_path()
+                    current_csv_entries = {}
+                    print(Color.CYAN(f'CSV file full. Creating new file: {current_csv_path.name}'))
+                
+                # Add entries to current CSV until it's full
+                space_remaining = self.csv_max_entries - len(current_csv_entries)
+                entries_to_add = remaining_new_entries[:space_remaining]
+                remaining_new_entries = remaining_new_entries[space_remaining:]
+                
+                for rel_path, classid in entries_to_add:
+                    current_csv_entries[rel_path] = classid
+            
+            # Write the last CSV file
+            if current_csv_entries:
+                sorted_entries = sorted(current_csv_entries.items(), key=lambda item: item[0])
+                try:
+                    with open(current_csv_path, 'w', encoding='utf-8') as f:
+                        for rel_path, classid in sorted_entries:
+                            f.write(f'{rel_path},{classid}\n')
+                    print(Color.GREEN(f'Saved {len(sorted_entries)} entries to {current_csv_path.name}'))
+                except (OSError, IOError) as e:
+                    print(Color.RED(f'Error writing {current_csv_path}: {e}'))
+            
+            # Clear annotation entries
+            self.annotation_entries = []
+            self.current_csv_entries = len(current_csv_entries) if current_csv_entries else 0
+        
+        if lock is not None:
+            # Use multiprocessing lock if provided
+            with lock:
+                _write_with_lock()
+        else:
+            # Use file-based lock for cross-process safety (Unix/Linux only)
+            lock_file_path = self._get_current_csv_path().with_suffix('.csv.lock')
+            if HAS_FCNTL:
+                lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with open(lock_file_path, 'w') as lock_file:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                        try:
+                            _write_with_lock()
+                        finally:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except (OSError, IOError) as e:
+                    print(Color.YELLOW(f'Warning: Could not acquire file lock, writing without lock: {e}'))
+                    _write_with_lock()
+            else:
+                # Windows: no fcntl, just write (multiprocessing lock should be used instead)
+                _write_with_lock()
 
     def write_histograms(self) -> None:
         for label_name in sorted(set(self.heights_by_label.keys()) | set(self.widths_by_label.keys())):
@@ -1024,6 +1201,65 @@ def load_label_from_json(image_path: Path) -> Optional[Tuple[str, int]]:
     return None
 
 
+def load_processed_image_stems(output_root: Path) -> set:
+    """Load set of already processed image stems from all annotation CSV files.
+    
+    Returns a set of image stems (base names) that have been processed.
+    The stem is extracted from crop filenames in the CSV.
+    Crop filename format: {image_stem}_{det_idx}_{hash}.png
+    """
+    processed = set()
+    output_root_path = Path(output_root)
+    
+    # Load from all annotation CSV files
+    csv_files = sorted(output_root_path.glob('annotation_*.csv'))
+    if not csv_files:
+        # Fallback: check for old annotation.csv
+        old_csv = output_root_path / 'annotation.csv'
+        if old_csv.exists():
+            csv_files = [old_csv]
+    
+    for csv_path in csv_files:
+        if not csv_path.exists():
+            continue
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ',' not in line:
+                        continue
+                    # CSV format: relative_path,classid
+                    # relative_path format: data/cropped/000001000/image_name_1_hash.png
+                    rel_path = line.split(',', 1)[0].strip()
+                    # Get filename without extension
+                    crop_filename = Path(rel_path).name
+                    # Extract base name: remove detection index and hash suffix
+                    # Format: image_name_1_hash -> image_name
+                    # Split from right, remove last 2 parts (detection_idx and hash)
+                    parts = crop_filename.rsplit('_', 2)
+                    if len(parts) >= 3:
+                        # Remove detection index and hash, keep base name
+                        base_name = '_'.join(parts[:-2])
+                        processed.add(base_name)
+                    elif len(parts) == 2:
+                        # Fallback: might be old format without hash
+                        # Try to check if second part is a number (detection index)
+                        try:
+                            int(parts[1].split('.')[0])  # Check if it's a number
+                            base_name = parts[0]
+                            processed.add(base_name)
+                        except ValueError:
+                            # Not a number, use whole stem
+                            processed.add(parts[0].split('.')[0])
+                    else:
+                        # Fallback: use filename without extension
+                        processed.add(Path(crop_filename).stem)
+        except (OSError, IOError) as e:
+            print(Color.YELLOW(f'Warning: Error reading {csv_path} to check processed images: {e}'))
+    
+    return processed
+
+
 def resolve_video_label(video_path: Path) -> Optional[Tuple[str, int]]:
     stem = video_path.stem.lower()
     if 'closed' in stem:
@@ -1064,54 +1300,417 @@ def run_eye_analysis(
     disable_gender_identification_mode: bool,
     disable_left_and_right_hand_identification_mode: bool,
     disable_headpose_identification_mode: bool,
+    num_workers: int = 1,
+    process_dataset_only: bool = False,
+    process_video_only: bool = False,
 ) -> None:
     output_root = Path('data') / 'cropped'
     tracker = EyeAnalysisTracker(output_root=output_root)
     dataset_crop_indexer = CropIndexer(root=tracker.output_root, start_folder=1)
     video_crop_indexer = CropIndexer(root=tracker.output_root, start_folder=100000001)
 
-    processed_any = False
-    for images_dir in image_dirs:
-        if not images_dir.exists() or not images_dir.is_dir():
-            print(Color.YELLOW(f'Skipping missing image directory: {images_dir}'))
-            continue
-        print(Color.GREEN(f'Processing image directory: {images_dir}'))
-        process_images_dir_for_eye_analysis(
-            model=model,
-            images_dir=images_dir,
-            tracker=tracker,
-            crop_indexer=dataset_crop_indexer,
-            disable_generation_identification_mode=disable_generation_identification_mode,
-            disable_gender_identification_mode=disable_gender_identification_mode,
-            disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
-            disable_headpose_identification_mode=disable_headpose_identification_mode,
-        )
-        processed_any = True
+    # Create a manager and lock for multiprocessing
+    manager = Manager() if num_workers > 1 else None
+    csv_lock = manager.Lock() if manager else None
 
-    for video_path in video_paths:
-        if not video_path.exists():
-            print(Color.YELLOW(f'Skipping missing video file: {video_path}'))
-            continue
-        print(Color.GREEN(f'Processing video file: {video_path}'))
-        process_video_for_eye_analysis(
-            model=model,
-            video_path=video_path,
-            tracker=tracker,
-            crop_indexer=video_crop_indexer,
-            disable_generation_identification_mode=disable_generation_identification_mode,
-            disable_gender_identification_mode=disable_gender_identification_mode,
-            disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
-            disable_headpose_identification_mode=disable_headpose_identification_mode,
-        )
-        processed_any = True
+    processed_any = False
+    
+    # Process image directories (dataset)
+    if not process_video_only:
+        for images_dir in image_dirs:
+            if not images_dir.exists() or not images_dir.is_dir():
+                print(Color.YELLOW(f'Skipping missing image directory: {images_dir}'))
+                continue
+            print(Color.GREEN(f'Processing image directory: {images_dir}'))
+            process_images_dir_for_eye_analysis(
+                model=model,
+                images_dir=images_dir,
+                tracker=tracker,
+                crop_indexer=dataset_crop_indexer,
+                disable_generation_identification_mode=disable_generation_identification_mode,
+                disable_gender_identification_mode=disable_gender_identification_mode,
+                disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
+                disable_headpose_identification_mode=disable_headpose_identification_mode,
+                num_workers=num_workers,
+                csv_lock=csv_lock,
+            )
+            # Update annotation.csv after each directory (may create multiple CSV files)
+            print(Color.CYAN(f'Updating annotation CSV files after processing {images_dir}...'))
+            tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
+            processed_any = True
+
+    # Process video files
+    if not process_dataset_only:
+        for video_path in video_paths:
+            if not video_path.exists():
+                print(Color.YELLOW(f'Skipping missing video file: {video_path}'))
+                continue
+            print(Color.GREEN(f'Processing video file: {video_path}'))
+            process_video_for_eye_analysis(
+                model=model,
+                video_path=video_path,
+                tracker=tracker,
+                crop_indexer=video_crop_indexer,
+                disable_generation_identification_mode=disable_generation_identification_mode,
+                disable_gender_identification_mode=disable_gender_identification_mode,
+                disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
+                disable_headpose_identification_mode=disable_headpose_identification_mode,
+                csv_lock=csv_lock,
+            )
+            # Update annotation.csv after each video (may create multiple CSV files)
+            print(Color.CYAN(f'Updating annotation CSV files after processing {video_path}...'))
+            tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
+            processed_any = True
 
     if not processed_any:
         print(Color.RED('ERROR: No valid sources were processed for eye analysis.'))
         return
 
+    # Final update and summary
     tracker.write_histograms()
-    tracker.write_annotation_csv()
+    tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
     tracker.print_summary()
+    
+    # Print summary of CSV files created
+    csv_files = tracker._get_all_csv_paths()
+    if csv_files:
+        print(Color.GREEN(f'\nCreated {len(csv_files)} annotation CSV file(s):'))
+        for csv_file in csv_files:
+            try:
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    count = sum(1 for _ in f)
+                print(f'  {csv_file.name}: {count} entries')
+            except (OSError, IOError):
+                print(f'  {csv_file.name}: (unable to read)')
+    
+    if manager:
+        manager.shutdown()
+
+
+# Global model variable for worker processes (initialized once per process)
+_worker_model = None
+_worker_model_params = None
+
+def _init_worker_model(model_params):
+    """Initialize model once per worker process."""
+    global _worker_model, _worker_model_params
+    import os
+    import time as time_module
+    import copy
+    worker_id = os.getpid()
+    init_start = time_module.time()
+    
+    # Ensure CUDA and TensorRT library paths are available in worker process
+    # This is critical for multiprocessing - child processes may not inherit LD_LIBRARY_PATH
+    library_paths = []
+    
+    # CUDA paths
+    cuda_paths = [
+        '/usr/local/cuda/lib64',
+        '/usr/local/cuda-11.8/lib64',
+        '/usr/local/cuda-12.0/lib64',
+        '/usr/local/cuda-12.1/lib64',
+        '/usr/local/cuda-12.2/lib64',
+    ]
+    for cuda_path in cuda_paths:
+        if os.path.exists(cuda_path):
+            library_paths.append(cuda_path)
+    
+    # TensorRT paths (common installation locations)
+    tensorrt_paths = [
+        '/usr/local/TensorRT/lib',
+        '/usr/local/TensorRT-8.x/lib',
+        '/usr/local/TensorRT-9.x/lib',
+        '/opt/tensorrt/lib',
+        '/usr/lib/x86_64-linux-gnu',  # Some systems install here
+    ]
+    # Also check for TensorRT in home directory
+    home = os.environ.get('HOME', '')
+    if home:
+        tensorrt_paths.extend([
+            f'{home}/TensorRT/lib',
+            f'{home}/TensorRT-8.x/lib',
+            f'{home}/TensorRT-9.x/lib',
+        ])
+    
+    for trt_path in tensorrt_paths:
+        if os.path.exists(trt_path):
+            # Check if libnvinfer.so exists in this path
+            try:
+                if os.path.exists(os.path.join(trt_path, 'libnvinfer.so')) or \
+                   any(f.startswith('libnvinfer.so') for f in os.listdir(trt_path) if os.path.isfile(os.path.join(trt_path, f))):
+                    library_paths.append(trt_path)
+            except:
+                pass
+    
+    # Update LD_LIBRARY_PATH
+    current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+    added_paths = []
+    for lib_path in library_paths:
+        if lib_path not in current_ld_path:
+            current_ld_path = f'{lib_path}:{current_ld_path}'
+            added_paths.append(lib_path)
+    
+    if added_paths:
+        os.environ['LD_LIBRARY_PATH'] = current_ld_path
+        print(Color.CYAN(f'[PID {worker_id}] Added to LD_LIBRARY_PATH: {", ".join(added_paths)}'), flush=True)
+    
+    # Get worker index for GPU assignment (round-robin across GPUs)
+    # Use a lock to ensure thread-safe counter increment
+    if not hasattr(_init_worker_model, '_lock'):
+        import threading
+        _init_worker_model._lock = threading.Lock()
+        _init_worker_model._worker_count = 0
+    
+    with _init_worker_model._lock:
+        worker_index = _init_worker_model._worker_count
+        _init_worker_model._worker_count = worker_index + 1
+    
+    # Set CUDA device before importing onnxruntime
+    # This helps ensure CUDA is properly initialized in the worker process
+    num_gpus = 2
+    gpu_id = worker_index % num_gpus
+    
+    # IMPORTANT: Don't set CUDA_VISIBLE_DEVICES here - it causes issues
+    # Instead, use device_id in the provider configuration
+    # Setting CUDA_VISIBLE_DEVICES would make only one GPU visible, breaking multi-GPU
+    
+    # Modify providers to use different GPU for each worker (if multiple GPUs available)
+    providers = copy.deepcopy(model_params['providers'])
+    
+    # Verify CUDA is available in this worker process
+    try:
+        import onnxruntime as ort
+        available_in_worker = ort.get_available_providers()
+        print(Color.CYAN(f'[PID {worker_id}] Available providers in worker: {available_in_worker}'), flush=True)
+    except:
+        pass
+    
+    # Check if CUDA/TensorRT provider exists and configure it with correct device_id
+    gpu_provider_found = False
+    
+    for i, provider in enumerate(providers):
+        if isinstance(provider, str):
+            if provider == 'CUDAExecutionProvider':
+                # Convert string to tuple with options
+                gpu_id = worker_index % num_gpus
+                providers[i] = (
+                    'CUDAExecutionProvider',
+                    {
+                        'device_id': gpu_id,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB per GPU (increased)
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'do_copy_in_default_stream': True,
+                        'tunable_op_enable': True,  # Enable tunable ops
+                        'tunable_op_tuning_enable': True,
+                    }
+                )
+                gpu_provider_found = True
+                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} (CUDA)...'), flush=True)
+                break
+            elif provider == 'TensorrtExecutionProvider':
+                # TensorRT also needs device_id
+                gpu_id = worker_index % num_gpus
+                providers[i] = (
+                    'TensorrtExecutionProvider',
+                    {
+                        'device_id': gpu_id,
+                        'trt_engine_cache_enable': True,
+                        'trt_fp16_enable': True,
+                    }
+                )
+                gpu_provider_found = True
+                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} (TensorRT)...'), flush=True)
+                break
+        elif isinstance(provider, tuple) and len(provider) == 2:
+            provider_name, provider_options = provider
+            if provider_name in ['CUDAExecutionProvider', 'TensorrtExecutionProvider']:
+                # Update existing GPU provider options
+                gpu_id = worker_index % num_gpus
+                if isinstance(provider_options, dict):
+                    provider_options = provider_options.copy()
+                    provider_options['device_id'] = gpu_id
+                else:
+                    provider_options = {'device_id': gpu_id}
+                providers[i] = (provider_name, provider_options)
+                gpu_provider_found = True
+                provider_type = 'CUDA' if provider_name == 'CUDAExecutionProvider' else 'TensorRT'
+                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} ({provider_type})...'), flush=True)
+                break
+    
+    if not gpu_provider_found:
+        print(Color.YELLOW(f'[PID {worker_id}] Warning: No GPU provider (CUDA/TensorRT) found in providers list!'), flush=True)
+        print(Color.YELLOW(f'[PID {worker_id}] Providers: {providers}'), flush=True)
+    
+    # Print progress for all workers
+    print(Color.CYAN(f'[PID {worker_id}] Loading model with providers: {providers}...'), flush=True)
+    _worker_model_params = model_params
+    
+    try:
+        _worker_model = DEIMv2(
+            runtime=model_params['runtime'],
+            model_path=model_params['model_path'],
+            obj_class_score_th=model_params['obj_class_score_th'],
+            attr_class_score_th=model_params['attr_class_score_th'],
+            keypoint_th=model_params['keypoint_th'],
+            providers=providers,  # Use modified providers with GPU assignment
+        )
+        init_time = time_module.time() - init_start
+        # Check which provider was actually used
+        actual_providers = _worker_model._providers
+        print(Color.GREEN(f'[PID {worker_id}] Model loaded successfully in {init_time:.1f}s'), flush=True)
+        print(Color.GREEN(f'[PID {worker_id}] Actually using providers: {actual_providers}'), flush=True)
+        
+        # Check if GPU is being used
+        gpu_used = False
+        for provider in actual_providers:
+            if isinstance(provider, str):
+                if provider in ['CUDAExecutionProvider', 'TensorrtExecutionProvider']:
+                    gpu_used = True
+                    break
+            elif isinstance(provider, tuple) and len(provider) > 0:
+                if provider[0] in ['CUDAExecutionProvider', 'TensorrtExecutionProvider']:
+                    gpu_used = True
+                    break
+        
+        if not gpu_used:
+            print(Color.RED(f'[PID {worker_id}] ⚠ CRITICAL ERROR: GPU is not being used! Using CPU instead.'), flush=True)
+            print(Color.RED(f'[PID {worker_id}] Configured providers: {providers}'), flush=True)
+            print(Color.RED(f'[PID {worker_id}] Actual providers: {actual_providers}'), flush=True)
+            print(Color.RED(f'[PID {worker_id}] This is a critical error - GPU must be used for large datasets!'), flush=True)
+            print(Color.RED(f'[PID {worker_id}] Worker will exit to prevent CPU processing.'), flush=True)
+            raise RuntimeError(f'Worker {worker_id} failed to use GPU. This is not allowed for large datasets.')
+        else:
+            print(Color.GREEN(f'[PID {worker_id}] ✓ GPU is being used successfully!'), flush=True)
+    except Exception as e:
+        print(Color.RED(f'[PID {worker_id}] Failed to initialize model: {e}'), flush=True)
+        import traceback
+        print(Color.RED(f'[PID {worker_id}] Traceback: {traceback.format_exc()}'), flush=True)
+        raise
+
+def _process_single_image_worker(args_tuple):
+    """Worker function for processing a single image in parallel."""
+    global _worker_model
+    import os  # Ensure os is available in worker process
+    
+    (
+        image_path_str,
+        disable_generation_identification_mode,
+        disable_gender_identification_mode,
+        disable_left_and_right_hand_identification_mode,
+        disable_headpose_identification_mode,
+        output_root,
+        start_folder,
+        folder_size,
+        processed_stems_set,
+    ) = args_tuple
+    
+    # Use pre-initialized model (loaded once per worker process)
+    if _worker_model is None:
+        raise RuntimeError("Worker model not initialized. This should not happen.")
+    model = _worker_model
+    
+    try:
+        image_path = Path(image_path_str)
+        # Check if already processed (for worker processes - double check)
+        image_stem = image_path.stem.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        if processed_stems_set and image_stem in processed_stems_set:
+            return {'detection_count': 0, 'crops': [], 'skipped': True}
+        
+        label_info = load_label_from_json(image_path)
+        if label_info is None:
+            return None
+        
+        image = cv2.imread(str(image_path))
+        if image is None:
+            return None
+        
+        label_name, classid = label_info
+        boxes = model(
+            image=image,
+            disable_generation_identification_mode=disable_generation_identification_mode,
+            disable_gender_identification_mode=disable_gender_identification_mode,
+            disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
+            disable_headpose_identification_mode=disable_headpose_identification_mode,
+        )
+        eye_boxes = [box for box in boxes if box.classid == 17]
+        eye_boxes.sort(key=lambda box: box.score, reverse=True)
+        detection_count = len(eye_boxes)
+        
+        if detection_count == 0:
+            return {'detection_count': 0, 'crops': []}
+        
+        # Process crops with process-safe file naming
+        crops_data = []
+        output_root_path = Path(output_root)
+        
+        # Use process ID and timestamp for unique file naming
+        process_id = os.getpid()
+        base_timestamp = int(time.time() * 1000000)
+        
+        for det_idx, box in enumerate(eye_boxes[:2]):
+            crop = crop_eye_region(image, box)
+            if crop is None or crop.size == 0:
+                continue
+            crop_height, crop_width = crop.shape[0], crop.shape[1]
+            if not is_valid_crop(label_name, crop_height, crop_width):
+                continue
+            
+            # Generate unique identifier combining image path, detection index, process ID, and timestamp
+            unique_str = f"{image_path_str}_{det_idx}_{process_id}_{base_timestamp}_{det_idx}"
+            unique_id = hashlib.md5(unique_str.encode()).hexdigest()[:12]
+            
+            # Use hash to determine folder distribution (consistent for same image)
+            hash_int = int(hashlib.md5(image_path_str.encode()).hexdigest()[:8], 16)
+            current_count = hash_int % 1000000  # Distribute across folders
+            
+            folder_number = start_folder + (current_count // folder_size)
+            folder_name = f'{folder_number:09d}'
+            folder_path = output_root_path / folder_name
+            folder_path.mkdir(parents=True, exist_ok=True)
+            
+            cleaned_base = image_path.stem.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            # Use unique identifier to avoid conflicts
+            file_name = f'{cleaned_base}_{det_idx + 1}_{unique_id}.png'
+            file_path = folder_path / file_name
+            
+            # Handle potential filename conflicts (should be very rare with unique_id)
+            counter = 0
+            while file_path.exists() and counter < 100:
+                counter += 1
+                unique_id = hashlib.md5(f"{unique_str}_{counter}".encode()).hexdigest()[:12]
+                file_name = f'{cleaned_base}_{det_idx + 1}_{unique_id}.png'
+                file_path = folder_path / file_name
+            
+            if counter >= 100:
+                # Fallback: use timestamp
+                timestamp = int(time.time() * 1000000)
+                file_name = f'{cleaned_base}_{det_idx + 1}_{process_id}_{timestamp}.png'
+                file_path = folder_path / file_name
+            
+            success = cv2.imwrite(str(file_path), crop)
+            if not success:
+                continue
+            
+            saved_rel_path = Path('data') / 'cropped' / folder_name / file_name
+            
+            crops_data.append({
+                'label_name': label_name,
+                'classid': classid,
+                'relative_path': str(saved_rel_path),
+                'height_px': crop_height,
+                'width_px': crop_width,
+            })
+        
+        return {
+            'detection_count': detection_count,
+            'crops': crops_data,
+        }
+    except Exception as e:
+        # Log error but don't crash the worker
+        print(Color.YELLOW(f'Error processing {image_path_str}: {e}'))
+        return None
 
 
 def process_images_dir_for_eye_analysis(
@@ -1124,55 +1723,222 @@ def process_images_dir_for_eye_analysis(
     disable_gender_identification_mode: bool,
     disable_left_and_right_hand_identification_mode: bool,
     disable_headpose_identification_mode: bool,
+    num_workers: int = 1,
+    csv_lock: Optional[Lock] = None,
 ) -> None:
     image_paths = list_image_files(str(images_dir))
     if not image_paths:
         print(Color.YELLOW(f'No image files found under {images_dir}'))
         return
-    total_images = len(image_paths)
-    for idx, image_path_str in enumerate(image_paths):
+    
+    # Load already processed images to skip them
+    processed_image_stems = load_processed_image_stems(tracker.output_root)
+    if processed_image_stems:
+        print(Color.CYAN(f'Found {len(processed_image_stems)} already processed images in CSV. Will skip them.'))
+    
+    # Filter out already processed images
+    remaining_images = []
+    skipped_count = 0
+    for image_path_str in image_paths:
         image_path = Path(image_path_str)
-        label_info = load_label_from_json(image_path)
-        if label_info is None:
-            print(Color.YELLOW(f'Skipping {image_path} because label metadata is unavailable.'))
+        # Normalize stem to match CSV format (replace spaces and path separators)
+        image_stem = image_path.stem.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        if image_stem in processed_image_stems:
+            skipped_count += 1
             continue
-        image = cv2.imread(str(image_path))
-        if image is None:
-            print(Color.YELLOW(f'Failed to read image: {image_path}'))
-            continue
-        label_name, classid = label_info
-        boxes = model(
-            image=image,
-            disable_generation_identification_mode=disable_generation_identification_mode,
-            disable_gender_identification_mode=disable_gender_identification_mode,
-            disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
-            disable_headpose_identification_mode=disable_headpose_identification_mode,
-        )
-        eye_boxes = [box for box in boxes if box.classid == 17]
-        eye_boxes.sort(key=lambda box: box.score, reverse=True)
-        detection_count = len(eye_boxes)
-        tracker.register_image(detection_count)
-        if detection_count == 0:
-            continue
-        for det_idx, box in enumerate(eye_boxes[:2]):
-            crop = crop_eye_region(image, box)
-            if crop is None or crop.size == 0:
+        remaining_images.append(image_path_str)
+    
+    if skipped_count > 0:
+        print(Color.GREEN(f'Skipping {skipped_count} already processed images. Remaining: {len(remaining_images)}'))
+    
+    if not remaining_images:
+        print(Color.YELLOW(f'All images in {images_dir} have already been processed.'))
+        return
+    
+    image_paths = remaining_images
+    total_images = len(image_paths)
+    
+    # If single worker, use original sequential processing
+    if num_workers <= 1:
+        start_time = time.time()
+        for idx, image_path_str in enumerate(image_paths):
+            image_path = Path(image_path_str)
+            # Double check: skip if already processed (shouldn't happen due to pre-filtering)
+            image_stem = image_path.stem.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            if image_stem in processed_image_stems:
                 continue
-            crop_height, crop_width = crop.shape[0], crop.shape[1]
-            if not is_valid_crop(label_name, crop_height, crop_width):
+            label_info = load_label_from_json(image_path)
+            if label_info is None:
+                print(Color.YELLOW(f'Skipping {image_path} because label metadata is unavailable.'))
                 continue
-            saved_rel_path = crop_indexer.save_crop(crop, base_name=image_path.stem, detection_idx=det_idx)
-            if saved_rel_path is None:
+            image = cv2.imread(str(image_path))
+            if image is None:
+                print(Color.YELLOW(f'Failed to read image: {image_path}'))
                 continue
-            tracker.register_crop(
-                label_name=label_name,
-                classid=classid,
-                relative_path=saved_rel_path,
-                height_px=crop_height,
-                width_px=crop_width,
+            label_name, classid = label_info
+            boxes = model(
+                image=image,
+                disable_generation_identification_mode=disable_generation_identification_mode,
+                disable_gender_identification_mode=disable_gender_identification_mode,
+                disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
+                disable_headpose_identification_mode=disable_headpose_identification_mode,
             )
-        if (idx + 1) % 100 == 0 or (idx + 1) == total_images:
-            print(f'Processed {idx + 1}/{total_images} images.')
+            eye_boxes = [box for box in boxes if box.classid == 17]
+            eye_boxes.sort(key=lambda box: box.score, reverse=True)
+            detection_count = len(eye_boxes)
+            tracker.register_image(detection_count)
+            if detection_count == 0:
+                continue
+            for det_idx, box in enumerate(eye_boxes[:2]):
+                crop = crop_eye_region(image, box)
+                if crop is None or crop.size == 0:
+                    continue
+                crop_height, crop_width = crop.shape[0], crop.shape[1]
+                if not is_valid_crop(label_name, crop_height, crop_width):
+                    continue
+                saved_rel_path = crop_indexer.save_crop(crop, base_name=image_path.stem, detection_idx=det_idx)
+                if saved_rel_path is None:
+                    continue
+                tracker.register_crop(
+                    label_name=label_name,
+                    classid=classid,
+                    relative_path=saved_rel_path,
+                    height_px=crop_height,
+                    width_px=crop_width,
+                )
+            
+            # Progress reporting with tqdm if available
+            processed_count = idx + 1
+            if HAS_TQDM:
+                if processed_count == 1:
+                    # Initialize progress bar
+                    pbar = tqdm(total=total_images, desc='Processing images', unit='img', ncols=100, mininterval=1.0)
+                pbar.update(1)
+                if processed_count % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = processed_count / elapsed if elapsed > 0 else 0
+                    eta_seconds = (total_images - processed_count) / rate if rate > 0 else 0
+                    eta_str = format_eta(eta_seconds)
+                    pbar.set_postfix({'rate': f'{rate:.1f} img/s', 'ETA': eta_str})
+                if processed_count == total_images:
+                    pbar.close()
+            
+            # Also print detailed progress every 100 images (for logging)
+            if processed_count % 100 == 0 or processed_count == total_images:
+                elapsed = time.time() - start_time
+                rate = processed_count / elapsed if elapsed > 0 else 0
+                eta_seconds = (total_images - processed_count) / rate if rate > 0 else 0
+                percentage = (processed_count / total_images * 100) if total_images > 0 else 0
+                eta_str = format_eta(eta_seconds)
+                print(f'[{percentage:5.1f}%] Processed {processed_count}/{total_images} images. '
+                      f'Rate: {rate:.1f} img/s, ETA: {eta_str}')
+        return
+    
+    # Multi-process parallel processing
+    print(Color.GREEN(f'Using {num_workers} parallel workers for processing...'))
+    print(Color.YELLOW('Initializing models in worker processes (this may take a moment)...'))
+    
+    # Prepare model parameters for worker processes
+    model_path = model._model_path
+    model_runtime = model._runtime
+    # Use configured providers, not actual providers (which may have fallen back to CPU)
+    model_providers = getattr(model, '_configured_providers', model._providers)
+    obj_class_score_th = model._obj_class_score_th
+    attr_class_score_th = model._attr_class_score_th
+    keypoint_th = model._keypoint_th
+    
+    # Prepare model parameters for worker initialization
+    model_params = {
+        'runtime': model_runtime,
+        'model_path': model_path,
+        'obj_class_score_th': obj_class_score_th,
+        'attr_class_score_th': attr_class_score_th,
+        'keypoint_th': keypoint_th,
+        'providers': model_providers,  # Use configured providers
+    }
+    
+    print(Color.CYAN(f'Passing providers to workers: {model_providers}'))
+    
+    # Prepare arguments for worker function (without model params, model is pre-loaded)
+    # Convert processed_image_stems to frozenset for pickling in multiprocessing
+    processed_stems_frozen = frozenset(processed_image_stems) if processed_image_stems else frozenset()
+    worker_args = [
+        (
+            image_path_str,
+            disable_generation_identification_mode,
+            disable_gender_identification_mode,
+            disable_left_and_right_hand_identification_mode,
+            disable_headpose_identification_mode,
+            str(tracker.output_root),
+            crop_indexer.start_folder,
+            crop_indexer.folder_size,
+            processed_stems_frozen,
+        )
+        for image_path_str in image_paths
+    ]
+    
+    # Process in parallel with model pre-initialization
+    processed_count = 0
+    start_time = time.time()
+    
+    # Reset worker counter before creating pool
+    _init_worker_model._worker_count = 0
+    
+    print(Color.YELLOW(f'Creating {num_workers} worker processes and loading models...'))
+    print(Color.YELLOW('Note: Model loading can take 30-120 seconds per worker, especially with TensorRT.'))
+    print(Color.YELLOW('This is normal - each worker needs to load the model into memory.'))
+    print(Color.YELLOW('Workers will be distributed across 2 GPUs automatically.'))
+    
+    with Pool(processes=num_workers, initializer=_init_worker_model, initargs=(model_params,)) as pool:
+        print(Color.GREEN(f'All {num_workers} workers initialized. Starting image processing...'))
+        # Increase chunksize to reduce task distribution overhead
+        results = pool.imap_unordered(_process_single_image_worker, worker_args, chunksize=50)
+        skipped_in_worker = 0
+        
+        # Use tqdm for progress bar if available
+        if HAS_TQDM:
+            results = tqdm(results, total=total_images, desc='Processing images', 
+                          unit='img', ncols=100, mininterval=1.0)
+        
+        for result in results:
+            processed_count += 1
+            if result is None:
+                continue
+            
+            # Skip if already processed (shouldn't happen due to pre-filtering, but check anyway)
+            if result.get('skipped', False):
+                skipped_in_worker += 1
+                continue
+            
+            detection_count = result['detection_count']
+            tracker.register_image(detection_count)
+            
+            for crop_data in result['crops']:
+                tracker.register_crop(
+                    label_name=crop_data['label_name'],
+                    classid=crop_data['classid'],
+                    relative_path=Path(crop_data['relative_path']),
+                    height_px=crop_data['height_px'],
+                    width_px=crop_data['width_px'],
+                )
+            
+            # Update progress bar description with rate info
+            if HAS_TQDM and processed_count % 10 == 0:
+                elapsed = time.time() - start_time
+                rate = processed_count / elapsed if elapsed > 0 else 0
+                eta_seconds = (total_images - processed_count) / rate if rate > 0 else 0
+                eta_str = format_eta(eta_seconds)
+                results.set_postfix({'rate': f'{rate:.1f} img/s', 'ETA': eta_str})
+            
+            # Also print detailed progress every 100 images (for logging)
+            if processed_count % 100 == 0 or processed_count == total_images:
+                elapsed = time.time() - start_time
+                rate = processed_count / elapsed if elapsed > 0 else 0
+                eta_seconds = (total_images - processed_count) / rate if rate > 0 else 0
+                percentage = (processed_count / total_images * 100) if total_images > 0 else 0
+                eta_str = format_eta(eta_seconds)
+                print(f'\n[{percentage:5.1f}%] Processed {processed_count}/{total_images} images. '
+                      f'Rate: {rate:.1f} img/s, ETA: {eta_str}')
 
 
 def process_video_for_eye_analysis(
@@ -1185,6 +1951,7 @@ def process_video_for_eye_analysis(
     disable_gender_identification_mode: bool,
     disable_left_and_right_hand_identification_mode: bool,
     disable_headpose_identification_mode: bool,
+    csv_lock: Optional[Lock] = None,
 ) -> None:
     label_info = resolve_video_label(video_path)
     if label_info is None:
@@ -1195,7 +1962,15 @@ def process_video_for_eye_analysis(
     if not cap.isOpened():
         print(Color.RED(f'ERROR: Failed to open video {video_path}'))
         return
+    
+    # Get total frame count for progress tracking
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        # If we can't get frame count, we'll process without percentage
+        total_frames = None
+    
     frame_idx = 0
+    start_time = time.time()
     try:
         while True:
             ret, frame = cap.read()
@@ -1233,10 +2008,51 @@ def process_video_for_eye_analysis(
                     height_px=crop_height,
                     width_px=crop_width,
                 )
-            if frame_idx % 100 == 0:
-                print(f'Processed {frame_idx} frames from {video_path}.')
+            
+            # Progress reporting
+            if frame_idx % 100 == 0 or (total_frames and frame_idx == total_frames):
+                elapsed = time.time() - start_time
+                rate = frame_idx / elapsed if elapsed > 0 else 0
+                if total_frames:
+                    percentage = (frame_idx / total_frames * 100) if total_frames > 0 else 0
+                    eta_seconds = (total_frames - frame_idx) / rate if rate > 0 else 0
+                    eta_str = format_eta(eta_seconds)
+                    print(f'[{percentage:5.1f}%] Processed {frame_idx}/{total_frames} frames from {video_path.name}. '
+                          f'Rate: {rate:.1f} fps, ETA: {eta_str}')
+                else:
+                    print(f'Processed {frame_idx} frames from {video_path.name}. Rate: {rate:.1f} fps')
     finally:
         cap.release()
+
+def format_eta(seconds: float) -> str:
+    """Format ETA (estimated time remaining) in a human-readable format.
+    
+    Parameters
+    ----------
+    seconds: float
+        Remaining time in seconds.
+    
+    Returns
+    -------
+    str
+        Formatted time string (e.g., "2h 30m 15s" or "45m 30s" or "30s").
+    """
+    if seconds < 0:
+        return "0s"
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 or len(parts) == 0:
+        parts.append(f"{secs}s")
+    
+    return " ".join(parts)
 
 def is_parsable_to_int(s):
     try:
@@ -1396,6 +2212,16 @@ def draw_skeleton(
         cv2.line(image, pt1, pt2, color, thickness=2)
 
 def main():
+    # CRITICAL: Set multiprocessing start method to 'spawn' at the very beginning
+    # This is essential for CUDA to work properly in multiprocessing
+    # CUDA contexts don't work well with fork(), so we must use spawn
+    try:
+        set_start_method('spawn', force=True)
+        print(Color.CYAN('✓ Using spawn method for multiprocessing (required for CUDA)'))
+    except RuntimeError:
+        # Already set, ignore
+        pass
+    
     parser = ArgumentParser()
 
     def check_positive(value):
@@ -1408,7 +2234,7 @@ def main():
         '-m',
         '--model',
         type=str,
-        default='deimv2_dinov3_x_wholebody34_1750query_n_batch.onnx',
+        default='deimv2_dinov3_x_wholebody34_680query_n_batch_640x640.onnx',
         help='ONNX/TFLite file path for DEIMv2.',
     )
     group_v_or_i = parser.add_mutually_exclusive_group(required=False)
@@ -1430,7 +2256,7 @@ def main():
         '--execution_provider',
         type=str,
         choices=['cpu', 'cuda', 'tensorrt'],
-        default='cpu',
+        default='cuda',
         help='Execution provider for ONNXRuntime.',
     )
     parser.add_argument(
@@ -1533,6 +2359,23 @@ def main():
         help='Enable eye-only analysis workflow (cropping, histograms, annotation export).',
     )
     parser.add_argument(
+        '-j',
+        '--jobs',
+        type=int,
+        default=None,
+        help='Number of parallel workers for image processing. Default: 1 (single-threaded). Use -j 4 for 4 workers, etc.',
+    )
+    parser.add_argument(
+        '--process-dataset-only',
+        action='store_true',
+        help='Only process image directories (dataset), skip video files.',
+    )
+    parser.add_argument(
+        '--process-video-only',
+        action='store_true',
+        help='Only process video files, skip image directories (dataset).',
+    )
+    parser.add_argument(
         '-drc',
         '--disable_render_classids',
         type=int,
@@ -1625,6 +2468,8 @@ def main():
     disable_left_and_right_hand_identification_mode: bool = args.disable_left_and_right_hand_identification_mode
     disable_headpose_identification_mode: bool = args.disable_headpose_identification_mode
     eye_analysis_enabled: bool = args.eye_analysis
+    # Use single thread by default, can be overridden with --jobs
+    num_workers: int = args.jobs if args.jobs is not None else 1
     if not eye_analysis_enabled and video is None and images_dir is None:
         parser.error('Either --video or --images_dir must be specified unless --eye_analysis is enabled.')
     disable_render_classids: List[int] = args.disable_render_classids
@@ -1638,6 +2483,82 @@ def main():
     inference_type = inference_type.lower()
     bounding_box_line_width: int = args.bounding_box_line_width
     camera_horizontal_fov: int = args.camera_horizontal_fov
+    
+    # Check if CUDA/TensorRT is available when using GPU provider
+    if execution_provider in ['cuda', 'tensorrt']:
+        try:
+            import onnxruntime as ort
+            available_providers = ort.get_available_providers()
+            
+            # Check onnxruntime version and build info
+            try:
+                build_info = ort.get_build_info()
+                print(Color.CYAN(f'ONNX Runtime version: {ort.__version__}'))
+                print(Color.CYAN(f'Build info: {build_info}'))
+            except:
+                pass
+            
+            # Check for CUDA provider (required for both CUDA and TensorRT)
+            if 'CUDAExecutionProvider' not in available_providers:
+                print(Color.RED('ERROR: CUDAExecutionProvider is not available!'))
+                print(Color.RED('This usually means:'))
+                print(Color.RED('  1. You installed onnxruntime (CPU version) instead of onnxruntime-gpu'))
+                print(Color.RED('  2. CUDA/cuDNN is not properly installed'))
+                print(Color.RED('  3. GPU drivers are not installed'))
+                print(Color.RED('  4. CUDA library path is not in LD_LIBRARY_PATH'))
+                print(Color.YELLOW(f'Available providers: {available_providers}'))
+                print()
+                print(Color.GREEN('Solution:'))
+                print(Color.GREEN('  1. Uninstall CPU version: pip uninstall onnxruntime'))
+                print(Color.GREEN('  2. Install GPU version: pip install onnxruntime-gpu'))
+                print(Color.GREEN('  3. Check CUDA: nvidia-smi'))
+                print(Color.GREEN('  4. Verify: python -c "import onnxruntime as ort; print(ort.get_available_providers())"'))
+                print()
+                print(Color.YELLOW('Note: If you still see this error after installing onnxruntime-gpu,'))
+                print(Color.YELLOW('      you may need to install CUDA and cuDNN separately.'))
+                print(Color.YELLOW('      Also check LD_LIBRARY_PATH includes CUDA libraries.'))
+                sys.exit(1)
+            
+            # Check for TensorRT provider if requested
+            if execution_provider == 'tensorrt':
+                if 'TensorrtExecutionProvider' not in available_providers:
+                    print(Color.YELLOW('WARNING: TensorrtExecutionProvider is not available!'))
+                    print(Color.YELLOW('Falling back to CUDAExecutionProvider.'))
+                    print(Color.YELLOW('To use TensorRT, you need:'))
+                    print(Color.YELLOW('  1. TensorRT installed'))
+                    print(Color.YELLOW('  2. TensorRT libraries in LD_LIBRARY_PATH'))
+                    print(Color.YELLOW('  3. Compatible CUDA version'))
+                    execution_provider = 'cuda'  # Fallback to CUDA
+                else:
+                    print(Color.GREEN(f'✓ TensorRT is available in providers list.'))
+                    # Check if TensorRT library can be found
+                    try:
+                        import subprocess
+                        result = subprocess.run(['ldconfig', '-p'], capture_output=True, text=True, timeout=2)
+                        if 'libnvinfer' not in result.stdout:
+                            print(Color.YELLOW('WARNING: TensorRT library (libnvinfer.so) not found in system library cache.'))
+                            print(Color.YELLOW('TensorRT may fail to load at runtime. The code will try to add TensorRT paths automatically.'))
+                            print(Color.YELLOW('If it still fails, consider using -ep cuda instead.'))
+                    except:
+                        pass
+                    print(Color.GREEN(f'Available providers: {available_providers}'))
+                    print(Color.CYAN('Note: If TensorRT fails to load, it will automatically fall back to CUDA.'))
+            else:
+                print(Color.GREEN(f'✓ CUDA is available. Available providers: {available_providers}'))
+            
+            # Try to create a test session to verify CUDA actually works
+            try:
+                import numpy as np
+                # Create a minimal test model or use a simple test
+                test_providers = [('CUDAExecutionProvider', {'device_id': 0})]
+                # Just check if provider can be initialized, don't create actual session
+                print(Color.CYAN('Verifying CUDA provider can be initialized...'))
+            except Exception as e:
+                print(Color.YELLOW(f'Warning: Could not verify CUDA provider: {e}'))
+                
+        except ImportError:
+            print(Color.YELLOW('Warning: Could not import onnxruntime to check CUDA availability'))
+    
     providers: List[Tuple[str, Dict] | str] = None
 
     if execution_provider == 'cpu':
@@ -1645,8 +2566,21 @@ def main():
             'CPUExecutionProvider',
         ]
     elif execution_provider == 'cuda':
+        # Configure CUDA provider with multi-GPU support
+        # For main process, use GPU 0 (workers will be assigned different GPUs)
         providers = [
-            'CUDAExecutionProvider',
+            (
+                'CUDAExecutionProvider',
+                {
+                    'device_id': 0,  # Primary GPU, workers will use different devices
+                    'arena_extend_strategy': 'kNextPowerOfTwo',
+                    'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB per GPU (increased for better performance)
+                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                    'do_copy_in_default_stream': True,
+                    'tunable_op_enable': True,  # Enable tunable ops for better performance
+                    'tunable_op_tuning_enable': True,
+                }
+            ),
             'CPUExecutionProvider',
         ]
     elif execution_provider == 'tensorrt':
@@ -1757,6 +2691,12 @@ def main():
             unique_video_paths.append(resolved)
             seen_videos.add(resolved)
 
+        process_dataset_only: bool = args.process_dataset_only
+        process_video_only: bool = args.process_video_only
+        
+        if process_dataset_only and process_video_only:
+            parser.error('--process-dataset-only and --process-video-only cannot be used together.')
+        
         run_eye_analysis(
             model=model,
             image_dirs=unique_image_dirs,
@@ -1765,6 +2705,9 @@ def main():
             disable_gender_identification_mode=disable_gender_identification_mode,
             disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
             disable_headpose_identification_mode=disable_headpose_identification_mode,
+            num_workers=num_workers,
+            process_dataset_only=process_dataset_only,
+            process_video_only=process_video_only,
         )
         return
 

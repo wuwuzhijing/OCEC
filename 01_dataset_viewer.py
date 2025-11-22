@@ -30,6 +30,13 @@ def resolve_image(image_data):
         if isinstance(file_info, Image.Image):
             img = file_info
 
+        elif isinstance(file_info, bytes):
+            # 二进制数据（从 parquet 文件中读取）
+            try:
+                img = Image.open(io.BytesIO(file_info))
+            except Exception as e:
+                print(f"[WARN] Could not decode image from bytes: {e}")
+
         elif isinstance(file_info, str) and os.path.exists(file_info):
             try:
                 img = Image.open(file_info)
@@ -48,6 +55,13 @@ def resolve_image(image_data):
     elif isinstance(image_data, Image.Image):
         img = image_data
 
+    elif isinstance(image_data, bytes):
+        # 直接传入二进制数据
+        try:
+            img = Image.open(io.BytesIO(image_data))
+        except Exception as e:
+            print(f"[WARN] Could not decode image from bytes: {e}")
+
     if img is None:
         return None
 
@@ -57,11 +71,16 @@ def resolve_image(image_data):
     return img.copy()
 
 
-def visualize_with_opencv(dataset, sample_count: int = 6, window_name: str = "Closed-Open Eyes Samples"):
-    """OpenCVを使ってランダムサンプルを可視化"""
+def visualize_with_opencv(dataset, sample_count: int = 6, output_dir: str = "visualization_output"):
+    """OpenCVを使ってランダムサンプルを可視化して保存"""
     indices = random.sample(range(len(dataset)), min(sample_count, len(dataset)))
-    print(f"👁 Showing {len(indices)} random samples with OpenCV...")
+    print(f"👁 Saving {len(indices)} random samples to {output_dir}...")
 
+    # 创建输出目录
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    saved_count = 0
     for i, idx in enumerate(indices):
         record = dataset[idx]
         label = record.get("Label", "unknown")
@@ -108,14 +127,19 @@ def visualize_with_opencv(dataset, sample_count: int = 6, window_name: str = "Cl
         draw_react_box(record.get("Left_eye_react"), (0, 255, 255), "Left eye")
         draw_react_box(record.get("Right_eye_react"), (255, 0, 0), "Right eye")
 
-        # 表示
-        cv2.imshow(window_name, img_np)
-        key = cv2.waitKey(0)
-        if key == 27:  # ESCで中断
-            print("🛑 ESC pressed. Exiting visualization.")
-            break
+        # 保存图像到本地
+        image_id = record.get("Image_id", idx)
+        filename = f"sample_{i+1:03d}_idx_{idx}_id_{image_id}_label_{label}.jpg"
+        filepath = output_path / filename
+        
+        try:
+            cv2.imwrite(str(filepath), img_np)
+            saved_count += 1
+            print(f"  ✅ Saved: {filename}")
+        except Exception as e:
+            print(f"  ⚠️  Failed to save {filename}: {e}")
 
-    cv2.destroyAllWindows()
+    print(f"✅ Saved {saved_count}/{len(indices)} samples to {output_path}")
 
 
 def extract_dataset(dataset, base_outdir: str, split: str):
@@ -191,46 +215,92 @@ def extract_dataset(dataset, base_outdir: str, split: str):
 def main():
     parser = argparse.ArgumentParser(description="Download and visualize MichalMlodawski/closed-open-eyes dataset with OpenCV.")
     parser.add_argument("--split", type=str, default="train", help="Dataset split (default: train)")
-    parser.add_argument("--visualize", action="store_true", help="Visualize random samples with OpenCV")
+    parser.add_argument("--visualize", action="store_true", help="Visualize random samples and save to local files")
     parser.add_argument("--sample-count", type=int, default=6, help="Number of samples to visualize")
-    parser.add_argument("--outdir", type=str, default="data", help="Output directory (default: ./data)")
+    parser.add_argument("--visualize-output", type=str, default="visualization_output", help="Output directory for visualized images (default: ./visualization_output)")
+    parser.add_argument("--outdir", type=str, default="data", help="Output directory for extracted images (default: ./data)")
     parser.add_argument("--force", action="store_true", help="Force re-download even if parquet exists")
     parser.add_argument("--extract", action="store_true", help="Extract images and annotations to --outdir/extracted/{split}")
+    parser.add_argument("--dataset-path", type=str, default="/ssddisk/guochuang/ocec/data", 
+                        help="Path to local dataset directory containing parquet files (default: /ssddisk/guochuang/ocec/data)")
     args = parser.parse_args()
 
     split = args.split
-    outdir = os.path.join(args.outdir, split)
-    os.makedirs(outdir, exist_ok=True)
-    parquet_path = os.path.join(outdir, f"{split}.parquet")
+    ds = None
+    dataset_loaded = False
 
-    # --- 既存Parquetチェック ---
-    if os.path.exists(parquet_path) and not args.force:
-        print(f"✅ {parquet_path} already exists.")
-        print("📖 Loading dataset from local Parquet ...")
-        ds = Dataset.from_parquet(parquet_path)
-    else:
+    # --- 优先检查本地数据集路径 ---
+    dataset_path = Path(args.dataset_path)
+    if dataset_path.exists() and dataset_path.is_dir():
+        # 查找 dataset_*.parquet 文件（Hugging Face 下载的格式）
+        parquet_files = sorted(dataset_path.glob("dataset_*.parquet"))
+        if parquet_files:
+            print(f"✅ Found local dataset directory: {dataset_path}")
+            print(f"📖 Found {len(parquet_files)} parquet files (dataset_*.parquet)")
+            print(f"📖 Loading dataset from multiple parquet files...")
+            try:
+                # 使用通配符模式加载所有 parquet 文件
+                parquet_pattern = str(dataset_path / "dataset_*.parquet")
+                ds = Dataset.from_parquet(parquet_pattern)
+                print(f"✅ Loaded {len(ds)} samples from {len(parquet_files)} parquet files")
+                dataset_loaded = True
+            except Exception as e:
+                print(f"⚠️  Failed to load dataset from parquet files: {e}")
+                print(f"📦 Falling back to download...")
+        else:
+            # 如果没有找到 dataset_*.parquet，尝试查找单个 {split}.parquet
+            parquet_file = dataset_path / f"{split}.parquet"
+            if parquet_file.exists():
+                print(f"✅ Found local dataset file: {parquet_file}")
+                print(f"📖 Loading dataset from {parquet_file}...")
+                try:
+                    ds = Dataset.from_parquet(str(parquet_file))
+                    print(f"✅ Loaded {len(ds)} samples from local file")
+                    dataset_loaded = True
+                except Exception as e:
+                    print(f"⚠️  Failed to load dataset from {parquet_file}: {e}")
+                    print(f"📦 Falling back to download...")
+            else:
+                print(f"⚠️  Directory {dataset_path} exists but no parquet files found.")
+                print(f"   Looking for: dataset_*.parquet or {split}.parquet")
+                print(f"📦 Falling back to download...")
+    elif dataset_path.exists() and dataset_path.is_file() and dataset_path.suffix == '.parquet':
+        # 直接指定了单个 parquet 文件
+        print(f"✅ Found local dataset file: {dataset_path}")
+        print("📖 Loading dataset from specified parquet file...")
+        try:
+            ds = Dataset.from_parquet(str(dataset_path))
+            print(f"✅ Loaded {len(ds)} samples from local file")
+            dataset_loaded = True
+        except Exception as e:
+            print(f"⚠️  Failed to load dataset from {dataset_path}: {e}")
+            print(f"📦 Falling back to download...")
+
+    # --- 如果本地加载失败，尝试从网上下载 ---
+    if not dataset_loaded:
         if args.force:
             print("⚠️  Force mode enabled. Re-downloading dataset...")
-        print(f"📦 Downloading dataset split='{split}' ...")
-        ds = load_dataset("MichalMlodawski/closed-open-eyes", split=split)
-        print(f"✅ Loaded {len(ds)} samples")
-
-        print(f"💾 Saving dataset to {parquet_path} ...")
-        ds.to_parquet(parquet_path)
-        print(f"✅ Saved parquet: {parquet_path}")
-
-        meta_path = os.path.join(outdir, "info.txt")
-        with open(meta_path, "w") as f:
-            f.write(f"Dataset: MichalMlodawski/closed-open-eyes\n")
-            f.write(f"Split: {split}\n")
-            f.write(f"Samples: {len(ds)}\n")
-        print(f"🧾 Metadata saved to {meta_path}")
+        print(f"📦 Downloading dataset split='{split}' from Hugging Face...")
+        try:
+            ds = load_dataset("MichalMlodawski/closed-open-eyes", split=split)
+            print(f"✅ Loaded {len(ds)} samples")
+            
+            # 保存到本地（可选）
+            outdir = os.path.join(args.outdir, split)
+            os.makedirs(outdir, exist_ok=True)
+            parquet_path = os.path.join(outdir, f"{split}.parquet")
+            print(f"💾 Saving dataset to {parquet_path} ...")
+            ds.to_parquet(parquet_path)
+            print(f"✅ Saved parquet: {parquet_path}")
+        except Exception as e:
+            print(f"❌ Failed to download dataset: {e}")
+            return
 
     if args.extract:
         extract_dataset(ds, args.outdir, split)
 
     if args.visualize:
-        visualize_with_opencv(ds, args.sample_count)
+        visualize_with_opencv(ds, args.sample_count, args.visualize_output)
     elif not args.extract:
         print("👁 Visualization disabled. Use --visualize to enable.")
 

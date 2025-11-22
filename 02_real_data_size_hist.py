@@ -1269,6 +1269,14 @@ def main():
         help=\
             'Camera horizontal FOV. Default: 90',
     )
+    parser.add_argument(
+        '-sf',
+        '--save_frames',
+        action='store_true',
+        help=\
+            'Save processed frames to local files instead of displaying. '+
+            'Useful for SSH connections without GUI. Frames will be saved to output/ directory.',
+    )
     args = parser.parse_args()
 
     # runtime check
@@ -1312,6 +1320,7 @@ def main():
     inference_type = inference_type.lower()
     bounding_box_line_width: int = args.bounding_box_line_width
     camera_horizontal_fov: int = args.camera_horizontal_fov
+    save_frames: bool = args.save_frames
     providers: List[Tuple[str, Dict] | str] = None
 
     if execution_provider == 'cpu':
@@ -1868,38 +1877,58 @@ def main():
             video_writer.write(debug_image)
             # video_writer.write(image)
 
-        cv2.imshow("test", debug_image)
-
-        key = cv2.waitKey(1) & 0xFF if file_paths is None or disable_waitKey else cv2.waitKey(0) & 0xFF
-        if key == ord('\x1b'): # 27, ESC
-            break
-        elif key == ord('b'): # 98, B, Bone drawing mode switch
-            enable_bone_drawing_mode = not enable_bone_drawing_mode
-        elif key == ord('n'): # 110, N, Generation mode switch
-            disable_generation_identification_mode = not disable_generation_identification_mode
-        elif key == ord('g'): # 103, G, Gender mode switch
-            disable_gender_identification_mode = not disable_gender_identification_mode
-        elif key == ord('p'): # 112, P, HeadPose mode switch
-            disable_headpose_identification_mode = not disable_headpose_identification_mode
-        elif key == ord('h'): # 104, H, HandsLR mode switch
-            disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
-        elif key == ord('k'): # 107, K, Keypoints mode switch
-            if keypoint_drawing_mode == 'dot':
-                keypoint_drawing_mode = 'box'
-            elif keypoint_drawing_mode == 'box':
-                keypoint_drawing_mode = 'both'
-            elif keypoint_drawing_mode == 'both':
-                keypoint_drawing_mode = 'dot'
-        elif key == ord('r'): # 114, R, Tracking mode switch
-            enable_tracking = not enable_tracking
-            if enable_tracking and not enable_trackid_overlay:
-                enable_trackid_overlay = True
-        elif key == ord('t'): # 116, T, TrackID overlay mode switch
-            enable_trackid_overlay = not enable_trackid_overlay
-            if not enable_tracking:
-                enable_trackid_overlay = False
-        elif key == ord('m'): # 109, M, Head distance measurement mode switch
-            enable_head_distance_measurement = not enable_head_distance_measurement
+        # Save frames to local files instead of displaying (for SSH/no GUI environments)
+        if save_frames:
+            # For video mode, save frames to output directory
+            if file_paths is None:
+                os.makedirs('output', exist_ok=True)
+                frame_filename = f'output/frame_{movie_frame_count:08d}.jpg'
+                cv2.imwrite(frame_filename, debug_image)
+                if movie_frame_count % 30 == 0:  # Print progress every 30 frames
+                    print(f"💾 Saved frame {movie_frame_count} to {frame_filename}")
+            # For image mode, frames are already saved above (lines 1835-1838)
+        else:
+            # Try to display, but fall back to saving if display fails (e.g., no GUI)
+            try:
+                cv2.imshow("test", debug_image)
+                key = cv2.waitKey(1) & 0xFF if file_paths is None or disable_waitKey else cv2.waitKey(0) & 0xFF
+                if key == ord('\x1b'): # 27, ESC
+                    break
+                elif key == ord('b'): # 98, B, Bone drawing mode switch
+                    enable_bone_drawing_mode = not enable_bone_drawing_mode
+                elif key == ord('n'): # 110, N, Generation mode switch
+                    disable_generation_identification_mode = not disable_generation_identification_mode
+                elif key == ord('g'): # 103, G, Gender mode switch
+                    disable_gender_identification_mode = not disable_gender_identification_mode
+                elif key == ord('p'): # 112, P, HeadPose mode switch
+                    disable_headpose_identification_mode = not disable_headpose_identification_mode
+                elif key == ord('h'): # 104, H, HandsLR mode switch
+                    disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
+                elif key == ord('k'): # 107, K, Keypoints mode switch
+                    if keypoint_drawing_mode == 'dot':
+                        keypoint_drawing_mode = 'box'
+                    elif keypoint_drawing_mode == 'box':
+                        keypoint_drawing_mode = 'both'
+                    elif keypoint_drawing_mode == 'both':
+                        keypoint_drawing_mode = 'dot'
+                elif key == ord('r'): # 114, R, Tracking mode switch
+                    enable_tracking = not enable_tracking
+                    if enable_tracking and not enable_trackid_overlay:
+                        enable_trackid_overlay = True
+                elif key == ord('t'): # 116, T, TrackID overlay mode switch
+                    enable_trackid_overlay = not enable_trackid_overlay
+                    if not enable_tracking:
+                        enable_trackid_overlay = False
+                elif key == ord('m'): # 109, M, Head distance measurement mode switch
+                    enable_head_distance_measurement = not enable_head_distance_measurement
+            except cv2.error:
+                # If display fails (e.g., no GUI), fall back to saving
+                if file_paths is None:
+                    os.makedirs('output', exist_ok=True)
+                    frame_filename = f'output/frame_{movie_frame_count:08d}.jpg'
+                    cv2.imwrite(frame_filename, debug_image)
+                    if movie_frame_count % 30 == 0:
+                        print(f"💾 Saved frame {movie_frame_count} to {frame_filename}")
 
     if video_writer is not None:
         video_writer.release()
@@ -1921,8 +1950,11 @@ def main():
         print(f'  Total Eye detections: {len(eye_stats.widths)}')
 
         if eye_stats.has_measurements:
-            output_root = Path('output_eye_analysis')
-            combined_hist_path = output_root / f'{dataset_label}_eye_size_hist.png'
+            output_root = Path('output_real_data_size_hist')
+            # Create subdirectory based on video/dataset name
+            video_output_dir = output_root / dataset_label
+            video_output_dir.mkdir(parents=True, exist_ok=True)
+            combined_hist_path = video_output_dir / 'eye_size_hist.png'
             hist_stats = plot_eye_histograms(
                 eye_stats.widths,
                 eye_stats.heights,
