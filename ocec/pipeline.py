@@ -805,6 +805,18 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         token_mixer_layers=config.token_mixer_layers,
     )
     model = OCEC(model_config).to(device)
+    
+    # Multi-GPU support using DataParallel
+    num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    use_multi_gpu = num_gpus > 1
+    if use_multi_gpu:
+        LOGGER.info(f"Using {num_gpus} GPUs for training with DataParallel")
+        model = nn.DataParallel(model)
+        # Note: Effective batch size will be batch_size * num_gpus
+        LOGGER.info(f"Effective batch size: {config.batch_size * num_gpus} (batch_size={config.batch_size} × {num_gpus} GPUs)")
+    else:
+        LOGGER.info("Using single GPU or CPU for training")
+    
     base_metadata = {
         "model_config": asdict(model_config),
         "train_config": train_config_serialized,
@@ -812,6 +824,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         "label_map": LABEL_MAP,
         "amp_enabled": amp_enabled,
         "tensorboard_logdir": str(tb_dir),
+        "num_gpus": num_gpus,
+        "use_multi_gpu": use_multi_gpu,
     }
 
     pos_weight = _compute_pos_weight(splits["train"]).to(device)
@@ -860,7 +874,19 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                     normalization,
                 )
 
-        model.load_state_dict(resume_payload["model_state"])
+        # Handle DataParallel model state dict
+        model_state = resume_payload["model_state"]
+        # If resuming to multi-GPU but checkpoint was single-GPU, or vice versa
+        if use_multi_gpu and not any(k.startswith("module.") for k in model_state.keys()):
+            # Checkpoint was single-GPU, but we're using multi-GPU now
+            LOGGER.info("Converting single-GPU checkpoint to multi-GPU format")
+            model_state = {f"module.{k}": v for k, v in model_state.items()}
+        elif not use_multi_gpu and any(k.startswith("module.") for k in model_state.keys()):
+            # Checkpoint was multi-GPU, but we're using single-GPU now
+            LOGGER.info("Converting multi-GPU checkpoint to single-GPU format")
+            model_state = {k.replace("module.", ""): v for k, v in model_state.items() if k.startswith("module.")}
+        
+        model.load_state_dict(model_state)
         if resume_payload.get("optimizer_state"):
             optimizer.load_state_dict(resume_payload["optimizer_state"])
         if resume_payload.get("scheduler_state"):
@@ -902,9 +928,18 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             else:
                 best_f1 = float("-inf")
 
+        # Handle model state dict format for resume
+        resume_model_state = copy.deepcopy(resume_payload["model_state"])
+        if use_multi_gpu and not any(k.startswith("module.") for k in resume_model_state.keys()):
+            # Checkpoint was single-GPU, but we're using multi-GPU now
+            resume_model_state = {f"module.{k}": v for k, v in resume_model_state.items()}
+        elif not use_multi_gpu and any(k.startswith("module.") for k in resume_model_state.keys()):
+            # Checkpoint was multi-GPU, but we're using single-GPU now
+            resume_model_state = {k.replace("module.", ""): v for k, v in resume_model_state.items() if k.startswith("module.")}
+        
         best_state = {
             "epoch": resume_payload.get("best_epoch", resume_epoch),
-            "model_state": copy.deepcopy(resume_payload["model_state"]),
+            "model_state": resume_model_state,
             "optimizer_state": copy.deepcopy(resume_payload.get("optimizer_state")),
             "scheduler_state": copy.deepcopy(resume_payload.get("scheduler_state")),
             "scaler_state": copy.deepcopy(resume_payload.get("scaler_state")),
@@ -1003,7 +1038,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         train_outputs = None
         val_outputs = None
 
-        model_state = model.state_dict()
+        # Get model state dict (unwrap DataParallel if needed)
+        model_state = model.module.state_dict() if use_multi_gpu else model.state_dict()
         optimizer_state = optimizer.state_dict()
         scheduler_state = scheduler.state_dict()
 
@@ -1018,6 +1054,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             "val_metrics": val_metrics,
         }
         epoch_path = config.output_dir / f"ocec_epoch_{epoch:04d}.pt"
+        
         torch.save(epoch_payload, epoch_path)
         _prune_checkpoints(config.output_dir, "ocec_epoch_", 10)
 
@@ -1027,6 +1064,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             accuracy_value = _infer_accuracy(train_metrics, val_metrics)
             best_f1 = score_value
             best_val_loss = current_val_loss
+            # model_state already unwrapped above
             best_state = {
                 "epoch": epoch,
                 "model_state": copy.deepcopy(model_state),
@@ -1055,7 +1093,13 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     if best_state is None or best_checkpoint_path is None:
         raise RuntimeError("Training did not produce a valid model checkpoint.")
 
-    model.load_state_dict(best_state["model_state"])
+    # Load best model state (unwrap DataParallel if needed)
+    best_model_state = best_state["model_state"]
+    if use_multi_gpu and not any(k.startswith("module.") for k in best_model_state.keys()):
+        best_model_state = {f"module.{k}": v for k, v in best_model_state.items()}
+    elif not use_multi_gpu and any(k.startswith("module.") for k in best_model_state.keys()):
+        best_model_state = {k.replace("module.", ""): v for k, v in best_model_state.items() if k.startswith("module.")}
+    model.load_state_dict(best_model_state)
 
     test_metrics = None
     if test_loader:
@@ -1538,8 +1582,10 @@ def export_to_onnx(
         output_path,
         input_names=["images"],
         output_names=["prob_open"],
-        dynamic_axes={"images": {0: "batch"}, "prob_open": {0: "batch"}},
+        dynamic_axes=None, #{"images": {0: "batch"}, "prob_open": {0: "batch"}},
+        do_constant_folding=False,
         opset_version=opset,
+        keep_initializers_as_inputs=False,
     )
     LOGGER.info("Exported ONNX model to %s", output_path)
 

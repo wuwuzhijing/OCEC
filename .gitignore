@@ -12,3 +12,15 @@ runs/
 *.profile
 *.mp4
 *.tar.gz
+*.jpeg
+*.png
+*.jpg
+*.log
+nv-tensorrt-local-repo-ubuntu2004-10.13.0-cuda-12.9_1.0-1_amd64.deb
+.gitignore
+setup_without_uv.sh
+rebuild_cropped_annotation.py
+nohup.out
+fix_uv_download.sh
+cudnn-local-repo-ubuntu2004-9.10.2_1.0-1_amd64.deb
+update_100000001_annotation.py

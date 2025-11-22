@@ -232,6 +232,8 @@ def create_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs for faster data loading
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches to reduce GPU idle time
     )
 
 
