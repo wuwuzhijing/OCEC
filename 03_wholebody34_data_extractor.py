@@ -1321,6 +1321,7 @@ def run_eye_analysis(
             if not images_dir.exists() or not images_dir.is_dir():
                 print(Color.YELLOW(f'Skipping missing image directory: {images_dir}'))
                 continue
+
             print(Color.GREEN(f'Processing image directory: {images_dir}'))
             process_images_dir_for_eye_analysis(
                 model=model,
@@ -1332,10 +1333,10 @@ def run_eye_analysis(
                 disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
                 disable_headpose_identification_mode=disable_headpose_identification_mode,
                 num_workers=num_workers,
-                csv_lock=csv_lock,
+                    csv_lock=csv_lock,
             )
-            # Update annotation.csv after each directory (may create multiple CSV files)
-            print(Color.CYAN(f'Updating annotation CSV files after processing {images_dir}...'))
+                # Update annotation.csv after each directory (may create multiple CSV files)
+            print(Color.GREEN(f'✓ Updating annotation CSV files after processing {images_dir}...'))
             tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
             processed_any = True
 
@@ -1355,9 +1356,9 @@ def run_eye_analysis(
                 disable_gender_identification_mode=disable_gender_identification_mode,
                 disable_left_and_right_hand_identification_mode=disable_left_and_right_hand_identification_mode,
                 disable_headpose_identification_mode=disable_headpose_identification_mode,
-                csv_lock=csv_lock,
+                    csv_lock=csv_lock,
             )
-            # Update annotation.csv after each video (may create multiple CSV files)
+                # Update annotation.csv after each video (may create multiple CSV files)
             print(Color.CYAN(f'Updating annotation CSV files after processing {video_path}...'))
             tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
             processed_any = True
@@ -1391,14 +1392,27 @@ def run_eye_analysis(
 _worker_model = None
 _worker_model_params = None
 
-def _init_worker_model(model_params):
-    """Initialize model once per worker process."""
+def _init_worker_model(model_params, worker_counter=None):
+    """Initialize model once per worker process.
+    
+    Args:
+        model_params: Model parameters dictionary
+        worker_counter: Shared multiprocessing.Value counter for assigning unique worker indices
+    """
     global _worker_model, _worker_model_params
     import os
     import time as time_module
     import copy
     worker_id = os.getpid()
     init_start = time_module.time()
+    
+    # Get unique worker index from shared counter
+    if worker_counter is not None:
+        with worker_counter.get_lock():
+            worker_index = worker_counter.value
+            worker_counter.value += 1
+    else:
+        worker_index = 0  # Fallback
     
     # Ensure CUDA and TensorRT library paths are available in worker process
     # This is critical for multiprocessing - child processes may not inherit LD_LIBRARY_PATH
@@ -1455,21 +1469,31 @@ def _init_worker_model(model_params):
         os.environ['LD_LIBRARY_PATH'] = current_ld_path
         print(Color.CYAN(f'[PID {worker_id}] Added to LD_LIBRARY_PATH: {", ".join(added_paths)}'), flush=True)
     
-    # Get worker index for GPU assignment (round-robin across GPUs)
-    # Use a lock to ensure thread-safe counter increment
-    if not hasattr(_init_worker_model, '_lock'):
-        import threading
-        _init_worker_model._lock = threading.Lock()
-        _init_worker_model._worker_count = 0
+    # Worker index is obtained from shared counter passed as argument
+    # This ensures each worker gets a unique index in spawn mode
     
-    with _init_worker_model._lock:
-        worker_index = _init_worker_model._worker_count
-        _init_worker_model._worker_count = worker_index + 1
+    # Dynamically detect number of GPUs available
+    num_gpus = 1
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi', '--list-gpus'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            num_gpus = len(result.stdout.strip().split('\n'))
+            print(Color.CYAN(f'[PID {worker_id}] Detected {num_gpus} GPU(s)'), flush=True)
+    except:
+        # Fallback: try to detect via CUDA
+        try:
+            import ctypes
+            cuda_lib = ctypes.CDLL('libcuda.so.1', mode=ctypes.RTLD_GLOBAL)
+            device_count = ctypes.c_int()
+            if cuda_lib.cuInit(0) == 0:
+                if cuda_lib.cuDeviceGetCount(ctypes.byref(device_count)) == 0:
+                    num_gpus = device_count.value
+        except:
+            pass
     
-    # Set CUDA device before importing onnxruntime
-    # This helps ensure CUDA is properly initialized in the worker process
-    num_gpus = 2
-    gpu_id = worker_index % num_gpus
+    if num_gpus < 1:
+        num_gpus = 1
     
     # IMPORTANT: Don't set CUDA_VISIBLE_DEVICES here - it causes issues
     # Instead, use device_id in the provider configuration
@@ -1489,17 +1513,19 @@ def _init_worker_model(model_params):
     # Check if CUDA/TensorRT provider exists and configure it with correct device_id
     gpu_provider_found = False
     
+    # Calculate which GPU this worker should use (round-robin)
+    gpu_id = worker_index % num_gpus
+    
     for i, provider in enumerate(providers):
         if isinstance(provider, str):
             if provider == 'CUDAExecutionProvider':
                 # Convert string to tuple with options
-                gpu_id = worker_index % num_gpus
                 providers[i] = (
                     'CUDAExecutionProvider',
                     {
                         'device_id': gpu_id,
                         'arena_extend_strategy': 'kNextPowerOfTwo',
-                        'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB per GPU (increased)
+                        'gpu_mem_limit': 12 * 1024 * 1024 * 1024,  # 12GB per GPU (RTX 3090 has 24GB, use half for safety)
                         'cudnn_conv_algo_search': 'EXHAUSTIVE',
                         'do_copy_in_default_stream': True,
                         'tunable_op_enable': True,  # Enable tunable ops
@@ -1507,11 +1533,10 @@ def _init_worker_model(model_params):
                     }
                 )
                 gpu_provider_found = True
-                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} (CUDA)...'), flush=True)
+                print(Color.GREEN(f'[PID {worker_id}] ✓ Worker {worker_index + 1} assigned to GPU {gpu_id}/{num_gpus-1} (CUDA)'), flush=True)
                 break
             elif provider == 'TensorrtExecutionProvider':
                 # TensorRT also needs device_id
-                gpu_id = worker_index % num_gpus
                 providers[i] = (
                     'TensorrtExecutionProvider',
                     {
@@ -1521,22 +1546,24 @@ def _init_worker_model(model_params):
                     }
                 )
                 gpu_provider_found = True
-                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} (TensorRT)...'), flush=True)
+                print(Color.GREEN(f'[PID {worker_id}] ✓ Worker {worker_index + 1} assigned to GPU {gpu_id}/{num_gpus-1} (TensorRT)'), flush=True)
                 break
         elif isinstance(provider, tuple) and len(provider) == 2:
             provider_name, provider_options = provider
             if provider_name in ['CUDAExecutionProvider', 'TensorrtExecutionProvider']:
                 # Update existing GPU provider options
-                gpu_id = worker_index % num_gpus
                 if isinstance(provider_options, dict):
                     provider_options = provider_options.copy()
                     provider_options['device_id'] = gpu_id
+                    # Increase GPU memory limit for better utilization
+                    if 'gpu_mem_limit' in provider_options:
+                        provider_options['gpu_mem_limit'] = 12 * 1024 * 1024 * 1024  # 12GB
                 else:
                     provider_options = {'device_id': gpu_id}
                 providers[i] = (provider_name, provider_options)
                 gpu_provider_found = True
                 provider_type = 'CUDA' if provider_name == 'CUDAExecutionProvider' else 'TensorRT'
-                print(Color.CYAN(f'[PID {worker_id}] Worker {worker_index + 1} configured to use GPU {gpu_id} ({provider_type})...'), flush=True)
+                print(Color.GREEN(f'[PID {worker_id}] ✓ Worker {worker_index + 1} assigned to GPU {gpu_id}/{num_gpus-1} ({provider_type})'), flush=True)
                 break
     
     if not gpu_provider_found:
@@ -1881,18 +1908,34 @@ def process_images_dir_for_eye_analysis(
     processed_count = 0
     start_time = time.time()
     
-    # Reset worker counter before creating pool
-    _init_worker_model._worker_count = 0
+    # Detect GPU count for reporting and worker assignment
+    num_gpus = 1
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi', '--list-gpus'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            num_gpus = len(result.stdout.strip().split('\n'))
+    except:
+        pass
     
-    print(Color.YELLOW(f'Creating {num_workers} worker processes and loading models...'))
+    print(Color.YELLOW(f'Creating {num_workers} worker processes ({num_gpus} GPU(s) available) and loading models...'))
+    print(Color.CYAN(f'Workers will be distributed across {num_gpus} GPU(s) in round-robin fashion'))
     print(Color.YELLOW('Note: Model loading can take 30-120 seconds per worker, especially with TensorRT.'))
     print(Color.YELLOW('This is normal - each worker needs to load the model into memory.'))
-    print(Color.YELLOW('Workers will be distributed across 2 GPUs automatically.'))
     
-    with Pool(processes=num_workers, initializer=_init_worker_model, initargs=(model_params,)) as pool:
-        print(Color.GREEN(f'All {num_workers} workers initialized. Starting image processing...'))
-        # Increase chunksize to reduce task distribution overhead
-        results = pool.imap_unordered(_process_single_image_worker, worker_args, chunksize=50)
+    # Create shared counter for worker index assignment
+    # This ensures each worker gets a unique index in spawn mode
+    from multiprocessing import Value
+    worker_counter = Value('i', 0)  # Shared integer counter
+    
+    # Create pool with shared counter for worker index assignment
+    with Pool(processes=num_workers, initializer=_init_worker_model, initargs=(model_params, worker_counter)) as pool:
+        print(Color.GREEN(f'✓ All {num_workers} workers initialized. Starting image processing...'))
+        # Use smaller chunksize for better load balancing and GPU utilization
+        # Smaller chunksize means tasks are distributed more frequently, reducing worker idle time
+        chunksize = max(1, total_images // (num_workers * 4))  # Dynamic chunksize based on workload
+        chunksize = min(chunksize, 20)  # Cap at 20 to ensure frequent task distribution
+        results = pool.imap_unordered(_process_single_image_worker, worker_args, chunksize=chunksize)
         skipped_in_worker = 0
         
         # Use tqdm for progress bar if available
@@ -2363,7 +2406,7 @@ def main():
         '--jobs',
         type=int,
         default=None,
-        help='Number of parallel workers for image processing. Default: 1 (single-threaded). Use -j 4 for 4 workers, etc.',
+        help='Number of parallel workers for image processing. Default: auto (8 workers per GPU for CUDA/TensorRT, 1 for CPU). Use -j 16 to override.',
     )
     parser.add_argument(
         '--process-dataset-only',
@@ -2468,8 +2511,28 @@ def main():
     disable_left_and_right_hand_identification_mode: bool = args.disable_left_and_right_hand_identification_mode
     disable_headpose_identification_mode: bool = args.disable_headpose_identification_mode
     eye_analysis_enabled: bool = args.eye_analysis
-    # Use single thread by default, can be overridden with --jobs
-    num_workers: int = args.jobs if args.jobs is not None else 1
+    # Auto-detect optimal worker count if not specified
+    # For GPU processing, use at least 2 workers per GPU for better utilization
+    if args.jobs is not None:
+        num_workers: int = args.jobs
+    else:
+        # Auto-detect GPU count and set workers accordingly
+        num_gpus = 1
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--list-gpus'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                num_gpus = len(result.stdout.strip().split('\n'))
+        except:
+            pass
+        
+        # Use 6-8 workers per GPU for better GPU utilization
+        # More workers help keep GPU busy while some workers are waiting for I/O
+        if execution_provider in ['cuda', 'tensorrt'] and num_gpus > 0:
+            num_workers = max(4, num_gpus * 8)  # At least 4 workers, or 8 per GPU for better utilization
+            print(Color.CYAN(f'Auto-detected {num_gpus} GPU(s), setting {num_workers} workers ({num_workers // num_gpus} per GPU) for optimal utilization'))
+        else:
+            num_workers = 1
     if not eye_analysis_enabled and video is None and images_dir is None:
         parser.error('Either --video or --images_dir must be specified unless --eye_analysis is enabled.')
     disable_render_classids: List[int] = args.disable_render_classids
@@ -2570,11 +2633,11 @@ def main():
         # For main process, use GPU 0 (workers will be assigned different GPUs)
         providers = [
             (
-                'CUDAExecutionProvider',
+            'CUDAExecutionProvider',
                 {
                     'device_id': 0,  # Primary GPU, workers will use different devices
                     'arena_extend_strategy': 'kNextPowerOfTwo',
-                    'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB per GPU (increased for better performance)
+                    'gpu_mem_limit': 12 * 1024 * 1024 * 1024,  # 12GB per GPU (RTX 3090 has 24GB, use half for safety)
                     'cudnn_conv_algo_search': 'EXHAUSTIVE',
                     'do_copy_in_default_stream': True,
                     'tunable_op_enable': True,  # Enable tunable ops for better performance
@@ -2696,7 +2759,7 @@ def main():
         
         if process_dataset_only and process_video_only:
             parser.error('--process-dataset-only and --process-video-only cannot be used together.')
-        
+
         run_eye_analysis(
             model=model,
             image_dirs=unique_image_dirs,
