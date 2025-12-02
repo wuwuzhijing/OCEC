@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import logging
+import time
+import threading
+import multiprocessing
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +15,11 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-DEFAULT_MEAN = [0.0, 0.0, 0.0]
-DEFAULT_STD = [1.0, 1.0, 1.0]
+# DEFAULT_MEAN = [0.0, 0.0, 0.0]
+# DEFAULT_STD = [1.0, 1.0, 1.0]
+
+DEFAULT_MEAN = [0.46961902, 0.46596417, 0.46912243]
+DEFAULT_STD  =  [0.17677383, 0.17855343, 0.17680589]
 
 _SPLIT_ALIASES: Dict[str, str] = {
     "train": "train",
@@ -43,13 +49,38 @@ class Sample:
     image_bytes: Optional[bytes]
 
 
-def _resolve_dataset_path(data_root: Path) -> Path:
+def _resolve_dataset_paths(data_root: Path) -> List[Path]:
+    """
+    Resolve dataset parquet file(s) from data_root.
+    Returns a list of parquet file paths.
+    """
+    parquet_files = []
+    
     if data_root.is_file() and data_root.suffix == ".parquet":
-        return data_root
-    candidate = data_root / "dataset.parquet"
-    if candidate.exists():
-        return candidate
-    raise FileNotFoundError(f"Could not locate dataset parquet under {data_root}.")
+        # Single file
+        return [data_root]
+    
+    if data_root.is_dir():
+        # Look for parquet files in directory
+        # First try: dataset_*.parquet (split files)
+        parquet_files = sorted(data_root.glob("dataset_*.parquet"))
+        if parquet_files:
+            return parquet_files
+        
+        # Second try: dataset.parquet (single file)
+        candidate = data_root / "dataset.parquet"
+        if candidate.exists():
+            return [candidate]
+        
+        # Third try: any *.parquet files
+        parquet_files = sorted(data_root.glob("*.parquet"))
+        if parquet_files:
+            return parquet_files
+    
+    raise FileNotFoundError(
+        f"Could not locate dataset parquet file(s) under {data_root}. "
+        f"Expected: a .parquet file, or a directory containing dataset_*.parquet or dataset.parquet"
+    )
 
 
 def _normalize_split(value: str) -> Optional[str]:
@@ -75,16 +106,33 @@ def _prepare_image_bytes(value: object) -> Optional[bytes]:
 
 
 def collect_samples(data_root: Path, logger: Optional[logging.Logger] = None) -> List[Sample]:
-    """Load samples from the parquet dataset."""
+    """Load samples from one or more parquet dataset files."""
 
     logger = logger or logging.getLogger(__name__)
-    dataset_path = _resolve_dataset_path(data_root)
-    df = pd.read_parquet(dataset_path)
-    if "split" not in df.columns:
-        raise ValueError(f"Dataset at {dataset_path} must contain a 'split' column.")
+    dataset_paths = _resolve_dataset_paths(data_root)
+    
+    if len(dataset_paths) > 1:
+        logger.info(f"Loading samples from {len(dataset_paths)} parquet files...")
+        for path in dataset_paths:
+            logger.info(f"  - {path.name}")
+    
+    # Load and merge all parquet files
+    dfs = []
+    for dataset_path in dataset_paths:
+        df_chunk = pd.read_parquet(dataset_path)
+        if "split" not in df_chunk.columns:
+            raise ValueError(f"Dataset at {dataset_path} must contain a 'split' column.")
+        dfs.append(df_chunk)
+    
+    # Merge all dataframes
+    df = pd.concat(dfs, ignore_index=True)
+    
+    if len(dataset_paths) > 1:
+        logger.info(f"Merged {len(dataset_paths)} parquet files into {len(df)} total rows.")
 
     samples: List[Sample] = []
-    dataset_dir = dataset_path.parent
+    # Use the first parquet file's directory as base for relative paths
+    dataset_dir = dataset_paths[0].parent
     for idx, row in df.iterrows():
         split = _normalize_split(row.get("split"))
         if split is None:
@@ -128,14 +176,16 @@ def collect_samples(data_root: Path, logger: Optional[logging.Logger] = None) ->
         )
 
     if not samples:
-        raise RuntimeError(f"No usable samples found in {dataset_path}.")
+        dataset_info = f"{len(dataset_paths)} file(s)" if len(dataset_paths) > 1 else str(dataset_paths[0])
+        raise RuntimeError(f"No usable samples found in {dataset_info}.")
 
     total = len(samples)
     counts = Counter(sample.split for sample in samples)
+    dataset_info = f"{len(dataset_paths)} file(s)" if len(dataset_paths) > 1 else dataset_paths[0].name
     logger.info(
         "Loaded %d samples from %s (splits: %s).",
         total,
-        dataset_path,
+        dataset_info,
         ", ".join(f"{name}={counts.get(name, 0)}" for name in ("train", "val", "test")),
     )
     return samples
@@ -233,7 +283,8 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,  # Keep workers alive between epochs for faster data loading
-        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches to reduce GPU idle time
+        prefetch_factor=8 if num_workers > 0 else None,  # Increased prefetch for better GPU utilization
+        drop_last=False,  # Don't drop last incomplete batch
     )
 
 

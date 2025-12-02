@@ -7,7 +7,7 @@ import random
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -22,8 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--annotation",
         type=Path,
-        default=Path("data/cropped/annotation.csv"),
-        help="Path to annotation CSV (default: data/cropped/annotation.csv).",
+        nargs='+',
+        default=None,
+        help=(
+            "Path(s) to annotation CSV file(s) or a directory containing CSV files. "
+            "If a directory is provided, all annotation_*.csv files will be loaded. "
+            "If multiple files are provided, they will be merged. "
+            "Default: data/cropped/list/ (if exists) or data/cropped/annotation.csv"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -48,23 +54,87 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Embed raw image bytes into the parquet output (column: image_bytes).",
     )
+    parser.add_argument(
+        "--max-rows-per-file",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of rows per parquet file. "
+            "If specified, the dataset will be split into multiple files. "
+            "Files will be named like: output_0001.parquet, output_0002.parquet, etc. "
+            "If not specified, all data will be written to a single file."
+        ),
+    )
     args = parser.parse_args()
     if not 0.0 < args.train_ratio < 1.0:
         parser.error("--train-ratio must be in the (0, 1) interval.")
     return args
 
 
-def load_annotations(annotation_path: Path) -> pd.DataFrame:
-    if not annotation_path.exists():
-        raise FileNotFoundError(f"Annotation file not found: {annotation_path}")
-    df = pd.read_csv(
-        annotation_path,
-        header=None,
-        names=("image_path", "class_id"),
-        dtype={"image_path": str, "class_id": int},
-    )
-    if df.empty:
-        raise ValueError(f"No entries loaded from {annotation_path}.")
+def find_csv_files(paths: List[Path]) -> List[Path]:
+    """Find all CSV files from given paths (files or directories)."""
+    csv_files = []
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Path not found: {path}")
+        
+        if path.is_file():
+            if path.suffix.lower() == '.csv':
+                csv_files.append(path)
+            else:
+                raise ValueError(f"Not a CSV file: {path}")
+        elif path.is_dir():
+            # Find all annotation_*.csv files in directory
+            found = sorted(path.glob('annotation_*.csv'))
+            if not found:
+                # Fallback: look for any CSV files
+                found = sorted(path.glob('*.csv'))
+            if not found:
+                raise ValueError(f"No CSV files found in directory: {path}")
+            csv_files.extend(found)
+        else:
+            raise ValueError(f"Invalid path (not a file or directory): {path}")
+    
+    return sorted(set(csv_files))  # Remove duplicates and sort
+
+
+def load_annotations(annotation_paths: List[Path]) -> pd.DataFrame:
+    """Load annotations from one or more CSV files."""
+    csv_files = find_csv_files(annotation_paths)
+    
+    if not csv_files:
+        raise ValueError("No CSV files found to load.")
+    
+    print(f"Loading annotations from {len(csv_files)} CSV file(s):")
+    for csv_file in csv_files:
+        print(f"  - {csv_file}")
+    
+    dfs = []
+    for csv_file in csv_files:
+        if not csv_file.exists():
+            raise FileNotFoundError(f"Annotation file not found: {csv_file}")
+        df = pd.read_csv(
+            csv_file,
+            header=None,
+            names=("image_path", "class_id"),
+            dtype={"image_path": str, "class_id": int},
+        )
+        if not df.empty:
+            dfs.append(df)
+    
+    if not dfs:
+        raise ValueError("No entries loaded from any CSV files.")
+    
+    # Merge all dataframes
+    df = pd.concat(dfs, ignore_index=True)
+    
+    # Remove duplicates (same image_path)
+    original_count = len(df)
+    df = df.drop_duplicates(subset=["image_path"], keep="first")
+    if len(df) < original_count:
+        print(f"Removed {original_count - len(df)} duplicate entries.")
+    
     df["image_path"] = df["image_path"].apply(lambda p: str(Path(p)))
     df["class_id"] = df["class_id"].astype(int)
     df["label"] = df.apply(lambda row: infer_label(row["image_path"], row["class_id"]), axis=1)
@@ -167,8 +237,65 @@ def validate_balances(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
     print("Split summary:", summary)
 
 
+def save_parquet_files(
+    df: pd.DataFrame,
+    output_path: Path,
+    max_rows_per_file: Optional[int] = None,
+) -> None:
+    """Save DataFrame to one or more parquet files."""
+    if max_rows_per_file is None or len(df) <= max_rows_per_file:
+        # Single file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(output_path, index=False)
+        print(f"Saved dataset to {output_path} ({len(df)} rows).")
+        return
+    
+    # Multiple files
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Generate base name and extension
+    base_name = output_path.stem
+    extension = output_path.suffix
+    output_dir = output_path.parent
+    
+    num_files = (len(df) + max_rows_per_file - 1) // max_rows_per_file
+    print(f"Splitting dataset into {num_files} files (max {max_rows_per_file} rows per file)...")
+    
+    for i in range(num_files):
+        start_idx = i * max_rows_per_file
+        end_idx = min((i + 1) * max_rows_per_file, len(df))
+        chunk_df = df.iloc[start_idx:end_idx]
+        
+        file_name = f"{base_name}_{i+1:04d}{extension}"
+        file_path = output_dir / file_name
+        chunk_df.to_parquet(file_path, index=False)
+        print(f"  Saved {file_path.name} ({len(chunk_df)} rows)")
+    
+    print(f"Saved dataset to {num_files} files in {output_dir}")
+
+
 def main() -> None:
     args = parse_args()
+    
+    # Handle default annotation paths
+    if args.annotation is None:
+        # Try default locations
+        default_list_dir = Path("data/cropped/list")
+        default_csv = Path("data/cropped/annotation.csv")
+        
+        if default_list_dir.exists() and default_list_dir.is_dir():
+            args.annotation = [default_list_dir]
+            print(f"Using default directory: {default_list_dir}")
+        elif default_csv.exists():
+            args.annotation = [default_csv]
+            print(f"Using default file: {default_csv}")
+        else:
+            raise FileNotFoundError(
+                f"Default annotation paths not found. "
+                f"Please specify --annotation. "
+                f"Tried: {default_list_dir}, {default_csv}"
+            )
+    
     df = load_annotations(args.annotation)
     if args.embed_images:
         df = embed_image_bytes(df)
@@ -180,11 +307,10 @@ def main() -> None:
         column_order.append("image_bytes")
     combined_df = combined_df[column_order].sort_values(["split", "label", "image_path"])
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    combined_df.to_parquet(args.output, index=False)
-
     validate_balances(train_df, val_df)
-    print(f"Saved dataset to {args.output} ({len(combined_df)} rows).")
+    
+    # Save to one or more parquet files
+    save_parquet_files(combined_df, args.output, args.max_rows_per_file)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ArcFaceHead(nn.Module):
+    def __init__(self, embedding_dim, num_classes=2, s=30.0, m=0.50):
+        super().__init__()
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embedding, labels=None):
+        emb = F.normalize(embedding, dim=1)
+        w = F.normalize(self.weight, dim=1)
+        logits = F.linear(emb, w)   # (B, 2)
+
+        if labels is None:
+            return logits * self.s
+
+        theta = torch.acos(torch.clamp(logits, -1 + 1e-7, 1 - 1e-7))
+        target_logits = torch.cos(theta + self.m)
+
+        one_hot = F.one_hot(labels.long(), num_classes=2)
+        logits = logits * (1 - one_hot) + target_logits * one_hot
+        return logits * self.s
+    
 @dataclass
 class ModelConfig:
     """Lightweight CNN configuration for OCEC."""
@@ -329,6 +352,7 @@ class OCEC(nn.Module):
     def __init__(self, config: Optional[ModelConfig] = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
+        self.use_arcface = False
         base = self.config.base_channels
         num_blocks = max(1, self.config.num_blocks)
         variant = (self.config.arch_variant or "baseline").lower()
@@ -397,6 +421,9 @@ class OCEC(nn.Module):
         self._feature_channels = channels
 
         self._init_weights()
+        if self.use_arcface:
+            emb_dim = self._feature_channels   # transformer/mixer head 的 embedding dim
+            self.arc_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2)
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -409,16 +436,39 @@ class OCEC(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, labels=None, return_embedding=False) -> torch.Tensor:
         x = self.stem(x)
         x = self.features(x)
+
         if self._head_variant in {"transformer", "mlp_mixer"}:
+            # transformer 输出前的 pooled token 作为 embedding
+            h, w = self._token_grid
+            height, width = x.shape[-2], x.shape[-1]
+            kernel_h = height // h
+            kernel_w = width // w
+            tokens = torch.nn.functional.avg_pool2d(x, (kernel_h, kernel_w), (kernel_h, kernel_w))
+            tokens = tokens.flatten(2).transpose(1, 2)  # (B, T, C)
+            embedding = tokens.mean(dim=1)              # (B, C)
             logits = self.head(x)
         else:
-            x = self._pool_features(x)
-            logits = self.head(x)
+            # CNN 分支
+            embedding = self._pool_features(x)   # (B,C)
+            logits = self.head(embedding)
+
         if logits.ndim == 2 and logits.shape[1] == 1:
             logits = logits.squeeze(1)
+
+        if self.use_arcface:
+            if return_embedding:
+                logits_arc = self.arc_head(embedding, labels)
+                return logits_arc, embedding
+            else:
+                logits_arc = self.arc_head(embedding, labels)
+                return logits_arc
+
+        # 原逻辑
+        if return_embedding:
+            return logits, embedding
         return logits
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:

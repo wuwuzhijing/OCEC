@@ -41,6 +41,9 @@ except ImportError:
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+import setproctitle
+setproctitle.setproctitle("data_extract")
+
 AVERAGE_HEAD_WIDTH: float = 0.16 + 0.10 # 16cm + Margin Compensation
 
 BOX_COLORS = [
@@ -890,9 +893,15 @@ class CropIndexer:
 class EyeAnalysisTracker:
     """Collect statistics and artifacts for eye-only analysis."""
 
-    def __init__(self, output_root: Path, csv_max_entries: int = 12000) -> None:
+    def __init__(self, output_root: Path, csv_max_entries: int = 12000, csv_output_root: Optional[Path] = None) -> None:
         self.output_root = Path(output_root)
         self.output_root.mkdir(parents=True, exist_ok=True)
+        # CSV files go to a separate 'list' subdirectory
+        if csv_output_root is None:
+            self.csv_output_root = self.output_root / 'list'
+        else:
+            self.csv_output_root = Path(csv_output_root)
+        self.csv_output_root.mkdir(parents=True, exist_ok=True)
         self.total_images = 0
         self.images_with_eye = 0
         self.over_detected = 0
@@ -933,11 +942,11 @@ class EyeAnalysisTracker:
 
     def _get_current_csv_path(self) -> Path:
         """Get the current CSV file path based on index."""
-        return self.output_root / f'annotation_{self.current_csv_index:04d}.csv'
+        return self.csv_output_root / f'annotation_{self.current_csv_index:04d}.csv'
     
     def _get_all_csv_paths(self) -> List[Path]:
         """Get all existing annotation CSV file paths."""
-        csv_files = sorted(self.output_root.glob('annotation_*.csv'))
+        csv_files = sorted(self.csv_output_root.glob('annotation_*.csv'))
         return csv_files
     
     def _load_all_existing_entries(self) -> Dict[str, int]:
@@ -1042,23 +1051,23 @@ class EyeAnalysisTracker:
             remaining_new_entries = new_entries.copy()
             
             while remaining_new_entries:
-                # Check if current CSV is full
+                # Check if current CSV is full (>= csv_max_entries)
                 if len(current_csv_entries) >= self.csv_max_entries:
-                    # Save current CSV
+                    # Save current CSV (it's full with exactly csv_max_entries)
                     sorted_entries = sorted(current_csv_entries.items(), key=lambda item: item[0])
                     try:
                         with open(current_csv_path, 'w', encoding='utf-8') as f:
                             for rel_path, classid in sorted_entries:
                                 f.write(f'{rel_path},{classid}\n')
-                        print(Color.GREEN(f'Saved {len(sorted_entries)} entries to {current_csv_path.name}'))
+                        print(Color.GREEN(f'✓ Saved {len(sorted_entries)} entries to {current_csv_path.name} (file is full)'))
                     except (OSError, IOError) as e:
                         print(Color.RED(f'Error writing {current_csv_path}: {e}'))
                     
-                    # Move to next CSV
+                    # Move to next CSV file (increment index)
                     self.current_csv_index += 1
                     current_csv_path = self._get_current_csv_path()
                     current_csv_entries = {}
-                    print(Color.CYAN(f'CSV file full. Creating new file: {current_csv_path.name}'))
+                    print(Color.CYAN(f'→ CSV file full ({self.csv_max_entries} entries). Creating new file: {current_csv_path.name}'))
                 
                 # Add entries to current CSV until it's full
                 space_remaining = self.csv_max_entries - len(current_csv_entries)
@@ -1068,14 +1077,14 @@ class EyeAnalysisTracker:
                 for rel_path, classid in entries_to_add:
                     current_csv_entries[rel_path] = classid
             
-            # Write the last CSV file
+            # Write the last CSV file (may be partially full, less than csv_max_entries)
             if current_csv_entries:
                 sorted_entries = sorted(current_csv_entries.items(), key=lambda item: item[0])
                 try:
                     with open(current_csv_path, 'w', encoding='utf-8') as f:
                         for rel_path, classid in sorted_entries:
                             f.write(f'{rel_path},{classid}\n')
-                    print(Color.GREEN(f'Saved {len(sorted_entries)} entries to {current_csv_path.name}'))
+                    print(Color.GREEN(f'✓ Saved {len(sorted_entries)} entries to {current_csv_path.name} (partial file)'))
                 except (OSError, IOError) as e:
                     print(Color.RED(f'Error writing {current_csv_path}: {e}'))
             
@@ -1184,24 +1193,45 @@ def save_eye_histogram(label_name: str, heights: List[int], widths: List[int], o
     plt.close(fig)
 
 
-def load_label_from_json(image_path: Path) -> Optional[Tuple[str, int]]:
-    json_path = image_path.with_suffix('.json')
-    if not json_path.exists():
+def _infer_label_from_filename(image_path: Path) -> Optional[Tuple[str, int]]:
+    """Fallback: derive label from filename suffix like *_0.jpg or *_1.jpg."""
+    stem = image_path.stem
+    # Extract trailing digits, e.g. foo_bar_1 -> 1
+    digit_part = []
+    for ch in reversed(stem):
+        if ch.isdigit():
+            digit_part.append(ch)
+        elif digit_part:
+            break
+    if not digit_part:
         return None
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            meta = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    label_value = meta.get('label')
-    if label_value == 'closed_eyes':
+    label_num = int(''.join(reversed(digit_part)))
+    if label_num == 0:
         return 'closed', 0
-    if label_value == 'open_eyes':
+    if label_num == 1:
         return 'open', 1
     return None
 
 
-def load_processed_image_stems(output_root: Path) -> set:
+def load_label_from_json(image_path: Path) -> Optional[Tuple[str, int]]:
+    json_path = image_path.with_suffix('.json')
+    if json_path.exists():
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            meta = None
+        if meta:
+            label_value = meta.get('label')
+            if label_value == 'closed_eyes':
+                return 'closed', 0
+            if label_value == 'open_eyes':
+                return 'open', 1
+    # Fallback to filename-based label inference
+    return _infer_label_from_filename(image_path)
+
+
+def load_processed_image_stems(output_root: Path, csv_output_root: Optional[Path] = None) -> set:
     """Load set of already processed image stems from all annotation CSV files.
     
     Returns a set of image stems (base names) that have been processed.
@@ -1211,13 +1241,24 @@ def load_processed_image_stems(output_root: Path) -> set:
     processed = set()
     output_root_path = Path(output_root)
     
+    # CSV files are in the 'list' subdirectory
+    if csv_output_root is None:
+        csv_output_root_path = output_root_path / 'list'
+    else:
+        csv_output_root_path = Path(csv_output_root)
+    
     # Load from all annotation CSV files
-    csv_files = sorted(output_root_path.glob('annotation_*.csv'))
+    csv_files = sorted(csv_output_root_path.glob('annotation_*.csv'))
     if not csv_files:
-        # Fallback: check for old annotation.csv
-        old_csv = output_root_path / 'annotation.csv'
+        # Fallback: check for old annotation.csv in list directory
+        old_csv = csv_output_root_path / 'annotation.csv'
         if old_csv.exists():
             csv_files = [old_csv]
+        else:
+            # Also check in the old location (output_root) for backward compatibility
+            old_csv_legacy = output_root_path / 'annotation.csv'
+            if old_csv_legacy.exists():
+                csv_files = [old_csv_legacy]
     
     for csv_path in csv_files:
         if not csv_path.exists():
@@ -1304,9 +1345,9 @@ def run_eye_analysis(
     process_dataset_only: bool = False,
     process_video_only: bool = False,
 ) -> None:
-    output_root = Path('data') / 'cropped'
+    output_root = Path('/10/cvz/guochuang/dataset/Classification/fatigue') / 'cropped'
     tracker = EyeAnalysisTracker(output_root=output_root)
-    dataset_crop_indexer = CropIndexer(root=tracker.output_root, start_folder=1)
+    dataset_crop_indexer = CropIndexer(root=tracker.output_root, start_folder=200000001)
     video_crop_indexer = CropIndexer(root=tracker.output_root, start_folder=100000001)
 
     # Create a manager and lock for multiprocessing
@@ -1759,7 +1800,7 @@ def process_images_dir_for_eye_analysis(
         return
     
     # Load already processed images to skip them
-    processed_image_stems = load_processed_image_stems(tracker.output_root)
+    processed_image_stems = load_processed_image_stems(tracker.output_root, csv_output_root=tracker.csv_output_root)
     if processed_image_stems:
         print(Color.CYAN(f'Found {len(processed_image_stems)} already processed images in CSV. Will skip them.'))
     
@@ -1833,6 +1874,12 @@ def process_images_dir_for_eye_analysis(
                     height_px=crop_height,
                     width_px=crop_width,
                 )
+            
+            # Periodically check and write CSV if entries accumulate too much
+            # This ensures we don't lose data if processing is interrupted
+            if len(tracker.annotation_entries) >= tracker.csv_max_entries:
+                print(Color.CYAN(f'Reached {len(tracker.annotation_entries)} entries, writing to CSV...'))
+                tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
             
             # Progress reporting with tqdm if available
             processed_count = idx + 1
@@ -1965,6 +2012,12 @@ def process_images_dir_for_eye_analysis(
                     width_px=crop_data['width_px'],
                 )
             
+            # Periodically check and write CSV if entries accumulate too much
+            # This ensures we don't lose data if processing is interrupted
+            if len(tracker.annotation_entries) >= tracker.csv_max_entries:
+                print(Color.CYAN(f'Reached {len(tracker.annotation_entries)} entries, writing to CSV...'))
+                tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
+            
             # Update progress bar description with rate info
             if HAS_TQDM and processed_count % 10 == 0:
                 elapsed = time.time() - start_time
@@ -2051,6 +2104,12 @@ def process_video_for_eye_analysis(
                     height_px=crop_height,
                     width_px=crop_width,
                 )
+            
+            # Periodically check and write CSV if entries accumulate too much
+            # This ensures we don't lose data if processing is interrupted
+            if len(tracker.annotation_entries) >= tracker.csv_max_entries:
+                print(Color.CYAN(f'Reached {len(tracker.annotation_entries)} entries, writing to CSV...'))
+                tracker.write_annotation_csv(lock=csv_lock, force_flush=True)
             
             # Progress reporting
             if frame_idx % 100 == 0 or (total_frames and frame_idx == total_frames):
@@ -2710,9 +2769,9 @@ def main():
                 video_paths_for_analysis.append(Path(video))
 
         if not image_dirs_for_analysis and not video_paths_for_analysis:
-            default_dir = Path('data') / 'extracted' / 'train'
-            image_dirs_for_analysis.append(default_dir)
-            real_data_dir = Path('real_data')
+            # default_dir = Path('data') / 'extracted' / 'train'
+            # image_dirs_for_analysis.append(default_dir)
+            real_data_dir = Path('real_data_test')
             default_videos: List[Path] = []
             if real_data_dir.exists():
                 def _video_sort_key(path: Path) -> Tuple[str, int]:

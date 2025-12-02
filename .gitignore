@@ -24,3 +24,8 @@ nohup.out
 fix_uv_download.sh
 cudnn-local-repo-ubuntu2004-9.10.2_1.0-1_amd64.deb
 update_100000001_annotation.py
+ocec/01pipe.py
+ocec/data_bak-py
+ocec/data-02.py
+ocec/pipeline_bak-py
+ocec/pipeline-02.py

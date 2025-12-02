@@ -1,1 +1,0 @@
-python -m ocec exportonnx --checkpoint runs/ocec/ocec_best_epoch0001_f1_0.0000.pt --output runs/ocec/ocec_best_epoch0001_f1_0.0000.onnx --opset 18

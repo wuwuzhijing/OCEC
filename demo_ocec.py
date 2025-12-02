@@ -818,7 +818,7 @@ class OCEC(AbstractModel):
         self,
         *,
         runtime: Optional[str] = 'onnx',
-        model_path: Optional[str] = 'ocec_l.onnx',
+        model_path: Optional[str] = 'ocec_best_epoch0035_f1_0.9918.onnx',
         providers: Optional[List] = None,
     ):
         super().__init__(
@@ -1464,7 +1464,7 @@ def main():
                 continue
             box.eye_prob_open = prob_open
             box.eye_state = 1 if prob_open >= 0.50 else 0
-            state_text = 'Open' if box.eye_state == 1 else 'Closed'
+            state_text = 'Open_{}'.format(f'{prob_open:.2f}') if box.eye_state == 1 else 'Closed_{}'.format(f'{prob_open:.2f}')
             box.eye_label = state_text
 
         if file_paths is None:

@@ -27,7 +27,426 @@ from torchvision.transforms import v2 as transforms_v2
 from PIL import Image
 from tqdm.auto import tqdm
 from matplotlib import pyplot as plt
+import torch.nn.functional as F
+import os
+import subprocess
+import atexit
 
+CONF_THRESHOLD = 0.5
+
+def plot_dual_pca(emb_raw, emb_arc, labels, save_path):
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        raise ImportError("sklearn is required for PCA visualization. Install it with: pip install scikit-learn")
+    
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    pca = PCA(n_components=2)
+    raw2 = pca.fit_transform(emb_raw)
+    arc2 = pca.fit_transform(emb_arc)
+
+    plt.figure(figsize=(12,5))
+
+    # Raw
+    plt.subplot(1,2,1)
+    for c in [0,1]:
+        idx = np.where(labels == c)
+        plt.scatter(raw2[idx,0], raw2[idx,1], s=6, label=str(c))
+    plt.title("Raw Embedding PCA")
+
+    # ArcFace
+    plt.subplot(1,2,2)
+    for c in [0,1]:
+        idx = np.where(labels == c)
+        plt.scatter(arc2[idx,0], arc2[idx,1], s=6, label=str(c))
+    plt.title("ArcFace Embedding PCA")
+    
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+    
+def cluster_small_eye(emb, labels, image_paths, save_root, n_clusters=5):
+    try:
+        from sklearn.manifold import TSNE
+        from sklearn.cluster import KMeans
+    except ImportError:
+        raise ImportError("sklearn is required for clustering. Install it with: pip install scikit-learn")
+    
+    import os, shutil
+    import numpy as np
+
+    # 只聚类：label=0（闭眼）
+    idx = np.where(labels == 0)[0]
+    X = emb[idx]
+    P = np.array(image_paths)[idx]
+
+    # t-SNE 降维到 2D 再聚
+    X_2d = TSNE(n_components=2, init="pca").fit_transform(X)
+
+    km = KMeans(n_clusters=n_clusters, n_init=10).fit(X_2d)
+    cluster_ids = km.labels_
+
+    for c in range(n_clusters):
+        cluster_dir = os.path.join(save_root, f"cluster_{c}")
+        os.makedirs(cluster_dir, exist_ok=True)
+
+        members = np.where(cluster_ids == c)[0]
+        for m in members:
+            shutil.copy(P[m], cluster_dir)
+
+    return True
+
+def create_montage(image_paths, save_path, cols=10, thumb_size=(64, 64)):
+    import math
+    from PIL import Image
+
+    if len(image_paths) == 0:
+        return
+
+    rows = math.ceil(len(image_paths) / cols)
+    mw = cols * thumb_size[0]
+    mh = rows * thumb_size[1]
+
+    canvas = Image.new("RGB", (mw, mh), "white")
+
+    for idx, path in enumerate(image_paths):
+        try:
+            img = Image.open(path).convert("RGB")
+            img = img.resize(thumb_size)
+            x = (idx % cols) * thumb_size[0]
+            y = (idx // cols) * thumb_size[1]
+            canvas.paste(img, (x, y))
+        except:
+            continue
+
+    canvas.save(save_path)
+
+
+def plot_tsne_2d(emb, labels, save_path):
+    try:
+        from sklearn.manifold import TSNE
+    except ImportError as e:
+        raise ImportError(f"sklearn is required for t-SNE visualization. Install it with: pip install scikit-learn. Original error: {e}")
+    
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    try:
+        tsne = TSNE(n_components=2, learning_rate='auto', init='pca')
+        emb_2d = tsne.fit_transform(emb)
+
+        plt.figure(figsize=(6,6))
+        for c in [0,1]:
+            idx = np.where(labels == c)
+            plt.scatter(emb_2d[idx,0], emb_2d[idx,1], s=6, alpha=0.6, label=str(c))
+        plt.legend()
+        plt.title("t-SNE 2D Embedding")
+        plt.savefig(save_path, dpi=160)
+        plt.close()
+    except Exception as e:
+        plt.close()  # 确保关闭图形
+        raise
+
+def make_pca_video(pca_folder, output_video="pca3d.mp4", fps=5):
+    cmd = [
+        "ffmpeg",
+        "-framerate", str(fps),
+        "-pattern_type", "glob",
+        "-i", f"{pca_folder}/*.png",
+        "-vf", "scale=800:-1",
+        "-pix_fmt", "yuv420p",
+        output_video
+    ]
+    subprocess.run(cmd)
+
+def plot_pca_3d(emb, labels, save_path):
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        raise ImportError("sklearn is required for PCA visualization. Install it with: pip install scikit-learn")
+    
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+
+    pca = PCA(n_components=3)
+    emb3 = pca.fit_transform(emb)
+
+    fig = plt.figure(figsize=(6,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for c in [0,1]:
+        idx = np.where(labels == c)
+        ax.scatter(emb3[idx,0], emb3[idx,1], emb3[idx,2], s=6, alpha=0.6)
+
+    ax.set_title("PCA 3D Embedding")
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+
+def detect_outliers_mahalanobis(emb, labels, threshold=3.0):
+    import numpy as np
+
+    outliers = []
+    for c in [0,1]:
+        idx = np.where(labels == c)[0]
+        X = emb[idx]
+        mu = X.mean(axis=0)
+        cov = np.cov(X.T) + np.eye(X.shape[1]) * 1e-6
+        inv_cov = np.linalg.inv(cov)
+
+        for i in idx:
+            diff = emb[i] - mu
+            dist = np.sqrt(diff @ inv_cov @ diff)
+            if dist > threshold:
+                outliers.append((i, labels[i], dist))
+
+    return sorted(outliers, key=lambda x: -x[2])
+
+#
+def detect_hard_samples(probs, labels, margin_th=0.15):
+    probs = np.array(probs)
+    margin = np.abs(probs - CONF_THRESHOLD)
+    hard_idx = np.where(margin < margin_th)[0]
+    return [(int(i), float(probs[i]), int(labels[i])) for i in hard_idx]
+
+
+
+def detect_mislabeled(probs, labels, emb, threshold=0.15):
+    # 思路：高置信度预测与标签冲突 + embedding 位置偏离
+    import numpy as np
+
+    wrong = []
+    for i in range(len(probs)):
+        p = probs[i]
+        pred = int(p >= CONF_THRESHOLD)
+        if pred != labels[i] and abs(p - CONF_THRESHOLD) > threshold:
+            wrong.append((i, int(labels[i]), pred, float(p)))
+    return wrong
+
+class FocalLabelSmoothCE(nn.Module):
+    def __init__(self, smoothing=0.05, gamma=2.0):
+        super().__init__()
+        self.smoothing = smoothing
+        self.gamma = gamma
+
+    def forward(self, logits, labels):
+        """
+        logits: [B, 2] 或 [B] 或 [B, 1]
+        labels: [B]
+        """
+        # 处理单个分数的情况：将 [B] 或 [B, 1] 转换为 [B, 2]
+        if logits.ndim == 1:
+            # [B] -> [B, 2]: 第一列是闭眼分数(-logit)，第二列是睁眼分数(logit)
+            logits = torch.stack([-logits, logits], dim=1)
+        elif logits.ndim == 2 and logits.size(1) == 1:
+            # [B, 1] -> [B, 2]
+            logits = logits.squeeze(1)
+            logits = torch.stack([-logits, logits], dim=1)
+        
+        num_classes = logits.size(1)
+
+        # ===== Label smoothing =====
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits)
+            true_dist.fill_(self.smoothing / (num_classes - 1))
+            true_dist.scatter_(1, labels.unsqueeze(1), 1 - self.smoothing)
+
+        # ===== Softmax =====
+        probs = torch.softmax(logits, dim=1)
+
+        # ===== Cross entropy =====
+        ce_loss = -(true_dist * torch.log(probs + 1e-7)).sum(dim=1)
+
+        # ===== Focal term =====
+        pt = probs.gather(1, labels.unsqueeze(1)).squeeze()  # p_t
+        focal_weight = (1 - pt) ** self.gamma
+
+        loss = focal_weight * ce_loss
+        return loss.mean()
+    
+class FocalLabelSmoothLoss(nn.Module):
+    def __init__(self, smoothing=0.05, gamma=2.0):
+        super().__init__()
+        self.smoothing = smoothing
+        self.gamma = gamma
+
+    def forward(self, logits, labels):
+        labels = labels.float()
+        with torch.no_grad():
+            smooth = labels * (1 - self.smoothing) + 0.5 * self.smoothing
+
+        prob = torch.sigmoid(logits)
+        bce = F.binary_cross_entropy(prob, smooth, reduction='none')
+
+        pt = prob * labels + (1 - prob) * (1 - labels)
+        focal = (1 - pt) ** self.gamma
+
+        return (focal * bce).mean()
+    
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        # initialize shadow parameters
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                key = name
+                # strip DP prefix from the name for shadow keys
+                if key.startswith("module."):
+                    key = key[7:]
+                self.shadow[key] = p.data.clone()
+
+    @torch.no_grad()
+    def update(self, model):
+        # EMA update
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            key = name
+            if key.startswith("module."):
+                key = key[7:]
+
+            assert key in self.shadow, f"[EMA] Missing key: {key}"
+            new_average = (1.0 - self.decay) * p.data + self.decay * self.shadow[key]
+            self.shadow[key] = new_average.clone()
+
+    @torch.no_grad()
+    def apply(self, model):
+        # Backup current params then load EMA shadow
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            key = name
+            if key.startswith("module."):
+                key = key[7:]
+
+            if key not in self.shadow:
+                print(f"[EMA] Warning: shadow missing for key {key}")
+                continue
+
+            self.backup[name] = p.data.clone()
+            p.data = self.shadow[key].clone()
+
+    @torch.no_grad()
+    def restore(self, model):
+        # Restore original params
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name in self.backup:
+                p.data = self.backup[name]
+        self.backup = {}
+        
+def compute_bayes_error(probs, labels, bins=200):
+    p0 = probs[labels == 0]
+    p1 = probs[labels == 1]
+    hist0, edges = np.histogram(p0, bins=bins, range=(0, 1), density=True)
+    hist1, _ = np.histogram(p1, bins=bins, range=(0, 1), density=True)
+    overlap = np.minimum(hist0, hist1).sum() * (edges[1] - edges[0])
+    return 0.5 * overlap
+
+def compute_class_separation(embeddings, labels):
+    emb = torch.tensor(embeddings)
+    lab = torch.tensor(labels)
+
+    cls0 = emb[lab == 0]
+    cls1 = emb[lab == 1]
+
+    mu0 = cls0.mean(dim=0)
+    mu1 = cls1.mean(dim=0)
+
+    intra0 = ((cls0 - mu0) ** 2).sum(dim=1).mean()
+    intra1 = ((cls1 - mu1) ** 2).sum(dim=1).mean()
+    intra = (intra0 + intra1) / 2
+
+    inter = torch.dist(mu0, mu1)
+
+    fisher = inter / (intra + 1e-8)
+
+    sigma0 = cls0.var(dim=0) + 1e-8
+    sigma1 = cls1.var(dim=0) + 1e-8
+    bc = 0.25 * torch.sum(torch.log(0.25 * (sigma0/sigma1 + sigma1/sigma0 + 2)))
+    bc += 0.25 * torch.sum((mu0 - mu1)**2 / (sigma0 + sigma1))
+
+    return dict(intra=float(intra), inter=float(inter), fisher=float(fisher), bhatta=float(bc))
+
+###############################################
+# 可分性 / 概率分布 / 特征结构监控指标（新增）
+###############################################
+
+def ks_distance(probs, labels):
+    probs = np.array(probs)
+    labels = np.array(labels)
+    p0 = np.sort(probs[labels == 0])
+    p1 = np.sort(probs[labels == 1])
+
+    cdf0 = np.arange(1, len(p0)+1) / len(p0)
+    cdf1 = np.arange(1, len(p1)+1) / len(p1)
+
+    m = max(len(p0), len(p1))
+    cdf0_i = np.interp(np.linspace(0,1,m), np.linspace(0,1,len(p0)), cdf0)
+    cdf1_i = np.interp(np.linspace(0,1,m), np.linspace(0,1,len(p1)), cdf1)
+
+    return float(np.max(np.abs(cdf0_i - cdf1_i)))
+
+
+def hellinger_distance(hist0, hist1):
+    return float(np.sqrt(1 - np.sum(np.sqrt(hist0 * hist1))))
+
+
+def kl_divergence(p, q):
+    eps = 1e-8
+    p = np.clip(p, eps, 1)
+    q = np.clip(q, eps, 1)
+    return float(np.sum(p * np.log(p / q)))
+
+
+def js_divergence(hist0, hist1):
+    m = 0.5 * (hist0 + hist1)
+    return 0.5 * kl_divergence(hist0, m) + 0.5 * kl_divergence(hist1, m)
+
+
+def expected_calibration_error(probs, labels, bins=10):
+    probs = np.array(probs)
+    labels = np.array(labels)
+    ece = 0.0
+    for i in range(bins):
+        s = i/bins
+        e = (i+1)/bins
+        mask = (probs >= s) & (probs < e)
+        if mask.sum() == 0: 
+            continue
+        conf = probs[mask].mean()
+        acc  = (probs[mask] > 0.5).astype(int).mean()
+        ece += len(probs[mask]) / len(probs) * abs(acc - conf)
+    return float(ece)
+
+
+def margin_score(probs):
+    probs = np.array(probs)
+    return float(np.mean(np.abs(probs - 0.5)))
+
+
+def embedding_pca_energy(embeddings, k=5):
+    emb = np.array(embeddings)
+    cov = np.cov(emb.T)
+    eigvals = np.linalg.eigvalsh(cov)[::-1]
+    energy = eigvals[:k] / eigvals.sum()
+    return energy.tolist()
+
+
+def sample_margin(probs, labels):
+    return np.mean(np.abs(probs - 0.5))
+
+def confidence_entropy(probs):
+    eps = 1e-8
+    return -(probs*np.log(probs+eps) + (1-probs)*np.log(1-probs+eps)).mean()
 from .data import (
     DEFAULT_MEAN,
     DEFAULT_STD,
@@ -188,6 +607,8 @@ class RandomCLAHE:
         self.clip_limit = float(clip_limit)
         self.tile_grid_size = tile_grid_size
         self.p = float(p)
+        # Pre-create CLAHE object to avoid repeated initialization overhead
+        self.clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if torch.rand(1).item() >= self.p:
@@ -195,8 +616,7 @@ class RandomCLAHE:
         np_img = np.array(img)
         lab = cv2.cvtColor(np_img, cv2.COLOR_RGB2LAB)
         l_channel, a_channel, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
-        l_channel = clahe.apply(l_channel)
+        l_channel = self.clahe.apply(l_channel)
         lab = cv2.merge((l_channel, a_channel, b_channel))
         rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
         return Image.fromarray(rgb)
@@ -336,6 +756,7 @@ class TrainConfig:
     device: str = "auto"
     resume_from: Optional[Path] = None
     use_amp: bool = False
+    warmup_epochs: int = 5  # Warmup阶段的epoch数，0表示不使用warmup
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -475,6 +896,7 @@ def _set_seed(seed: int) -> None:
 
 def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[float]):
     height, width = _ensure_image_size_tuple(image_size)
+    print("mean = {}, std = {}", mean, std)
     train_transform = transforms.Compose(
         [
             transforms.Resize((height, width)),
@@ -535,7 +957,9 @@ def _run_epoch(
     autocast_enabled: bool = False,
     progress_desc: Optional[str] = None,
     collect_outputs: bool = False,
+    use_focal_loss: bool = False,  # 标记是否使用FocalLabelSmoothCE
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
+    all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
         empty_metrics = {
             "loss": float("nan"),
@@ -559,14 +983,20 @@ def _run_epoch(
 
     for batch in iterator:
         images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True).long()
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
-
+        
         with _autocast(autocast_enabled):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            logits, embedding = model(images, labels=labels, return_embedding=True)
+            # 处理不同形状的logits：如果是[B, 2]形状（arcface输出），提取正类logit用于BCE
+            if logits.ndim == 2 and logits.shape[1] == 2:
+                # arcface输出[B, 2]，提取正类（类别1）的logit用于BCE损失
+                logits_bce = logits[:, 1]
+            else:
+                logits_bce = logits
+            loss = criterion(logits_bce, labels.float())
 
         if train_mode:
             if scaler is not None:
@@ -576,22 +1006,104 @@ def _run_epoch(
             else:
                 loss.backward()
                 optimizer.step()
+                if train_mode and ema is not None:
+                    ema.update(model)
 
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
         stats["samples"] += batch_size
 
-        probs = torch.sigmoid(logits)
-        preds = (probs >= 0.5).long()
+
+        # ---- 处理不同形状的 logits，恢复单通道开眼概率 ----
+        # 如果使用FocalLabelSmoothCE，需要与训练时保持一致的计算方式
+        if use_focal_loss and logits.ndim == 1:
+            # FocalLabelSmoothCE训练时使用: [-logit, logit] -> softmax -> [p_close, p_open]
+            # 评估时也应该使用相同方式
+            logits_2d = torch.stack([-logits, logits], dim=1)  # [B, 2]
+            probs = torch.softmax(logits_2d, dim=1)[:, 1]      # 取睁眼概率
+        elif use_focal_loss and logits.ndim == 2 and logits.size(1) == 1:
+            # [B, 1] -> 转换为 [B, 2] 然后softmax
+            logits_1d = logits.squeeze(1)
+            logits_2d = torch.stack([-logits_1d, logits_1d], dim=1)
+            probs = torch.softmax(logits_2d, dim=1)[:, 1]
+        elif logits.ndim == 2 and logits.size(1) == 2:
+            # [B, 2] -> 使用 softmax 取第二列（睁眼概率）
+            # ArcFace输出的logits可能很大（乘以s=30），需要先归一化或直接softmax
+            probs = torch.softmax(logits, dim=1)[:, 1]   # shape: [B]
+        elif logits.ndim == 2 and logits.size(1) == 1:
+            # [B, 1] -> 使用 sigmoid
+            probs = torch.sigmoid(logits.squeeze(1))     # shape: [B]
+        else:
+            # [B] -> 使用 sigmoid (BCEWithLogitsLoss的情况)
+            probs = torch.sigmoid(logits)                # shape: [B]
+        
+        # 确保probs在有效范围内 [0, 1]
+        probs = torch.clamp(probs, min=0.0, max=1.0)
+
+        # 单通道二分类决策阈值
+        preds = (probs >= CONF_THRESHOLD).long()                # shape: [B]
+        
         labels_int = labels.long()
         stats["tp"] += ((preds == 1) & (labels_int == 1)).sum().item()
         stats["tn"] += ((preds == 0) & (labels_int == 0)).sum().item()
         stats["fp"] += ((preds == 1) & (labels_int == 0)).sum().item()
         stats["fn"] += ((preds == 0) & (labels_int == 1)).sum().item()
+        
+        # 调试信息：检查logits和probs的分布（仅在验证时且第一个batch）
+        if not train_mode and stats["samples"] == batch_size:
+            # 获取原始logits用于调试
+            if logits.ndim == 2 and logits.size(1) == 2:
+                logits_col0 = logits[:, 0].detach()  # 闭眼类别的logit
+                logits_col1 = logits[:, 1].detach()  # 睁眼类别的logit
+                logits_debug = logits_col1  # 用于显示睁眼类别的logit
+                logits_col0_mean = logits_col0.mean().item()
+                logits_col0_std = logits_col0.std().item()
+                logits_col0_min = logits_col0.min().item()
+                logits_col0_max = logits_col0.max().item()
+                logits_col1_mean = logits_col1.mean().item()
+                logits_col1_std = logits_col1.std().item()
+                logits_col1_min = logits_col1.min().item()
+                logits_col1_max = logits_col1.max().item()
+                logits_info = (
+                    f"col0: mean={logits_col0_mean:.3f}, std={logits_col0_std:.3f}, "
+                    f"range=[{logits_col0_min:.3f}, {logits_col0_max:.3f}]; "
+                    f"col1: mean={logits_col1_mean:.3f}, std={logits_col1_std:.3f}, "
+                    f"range=[{logits_col1_min:.3f}, {logits_col1_max:.3f}]"
+                )
+            elif logits.ndim == 2 and logits.size(1) == 1:
+                logits_debug = logits.squeeze(1).detach()
+                logits_info = "single column [B, 1]"
+            else:
+                logits_debug = logits.detach()
+                logits_info = "single dimension [B]"
+            
+            logits_mean = logits_debug.mean().item()
+            logits_std = logits_debug.std().item()
+            logits_min = logits_debug.min().item()
+            logits_max = logits_debug.max().item()
+            probs_mean = probs.detach().mean().item()
+            probs_std = probs.detach().std().item()
+            probs_min = probs.detach().min().item()
+            probs_max = probs.detach().max().item()
+            pred_pos_ratio = (preds == 1).float().mean().item()
+            label_pos_ratio = (labels_int == 1).float().mean().item()
+            batch_tp = ((preds == 1) & (labels_int == 1)).sum().item()
+            batch_fp = ((preds == 1) & (labels_int == 0)).sum().item()
+            batch_fn = ((preds == 0) & (labels_int == 1)).sum().item()
+            batch_tn = ((preds == 0) & (labels_int == 0)).sum().item()
+            LOGGER.info(
+                f"Val batch debug - logits shape: {logits.shape}, use_focal_loss: {use_focal_loss}, "
+                f"logits ({logits_info}), "
+                f"probs: mean={probs_mean:.3f}, std={probs_std:.3f}, "
+                f"range=[{probs_min:.3f}, {probs_max:.3f}], "
+                f"pred_pos_ratio={pred_pos_ratio:.3f}, label_pos_ratio={label_pos_ratio:.3f}, "
+                f"TP={batch_tp}, FP={batch_fp}, FN={batch_fn}, TN={batch_tn}"
+            )
 
         if collect_outputs:
             collected_probs.append(probs.detach().cpu())
             collected_labels.append(labels.detach().cpu())
+            all_embeddings.append(embedding.detach().cpu())
 
     assert stats["samples"] > 0, "No samples processed during epoch."
 
@@ -600,6 +1112,33 @@ def _run_epoch(
     precision = stats["tp"] / (stats["tp"] + stats["fp"]) if (stats["tp"] + stats["fp"]) > 0 else 0.0
     recall = stats["tp"] / (stats["tp"] + stats["fn"]) if (stats["tp"] + stats["fn"]) > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    
+    # 添加详细的统计信息
+    total_pos_labels = stats["tp"] + stats["fn"]  # 实际正类数量
+    total_neg_labels = stats["tn"] + stats["fp"]  # 实际负类数量
+    total_pos_preds = stats["tp"] + stats["fp"]    # 预测为正类的数量
+    total_neg_preds = stats["tn"] + stats["fn"]   # 预测为负类的数量
+    label_pos_ratio = total_pos_labels / stats["samples"] if stats["samples"] > 0 else 0.0
+    pred_pos_ratio = total_pos_preds / stats["samples"] if stats["samples"] > 0 else 0.0
+    
+    # 计算概率统计（如果收集了输出）
+    prob_stats = ""
+    if collect_outputs and collected_probs:
+        all_probs = torch.cat(collected_probs).numpy()
+        prob_mean = float(all_probs.mean())
+        prob_std = float(all_probs.std())
+        prob_median = float(np.median(all_probs))
+        prob_q25 = float(np.percentile(all_probs, 25))
+        prob_q75 = float(np.percentile(all_probs, 75))
+        prob_stats = f", probs: mean={prob_mean:.3f}, std={prob_std:.3f}, median={prob_median:.3f}, q25={prob_q25:.3f}, q75={prob_q75:.3f}"
+    
+    split_name = "Val" if not train_mode else "Train"
+    LOGGER.info(
+        f"{split_name} epoch summary - samples: {stats['samples']}, "
+        f"TP: {stats['tp']}, TN: {stats['tn']}, FP: {stats['fp']}, FN: {stats['fn']}, "
+        f"label_pos_ratio: {label_pos_ratio:.4f}, pred_pos_ratio: {pred_pos_ratio:.4f}, "
+        f"recall: {recall:.4f}, precision: {precision:.4f}{prob_stats}"
+    )
 
     metrics = {
         "loss": avg_loss,
@@ -615,7 +1154,9 @@ def _run_epoch(
         extras = {
             "probs": all_probs.astype(float, copy=False),
             "labels": all_labels.astype(int, copy=False),
+            "embeddings": torch.cat(all_embeddings).numpy() if all_embeddings else None,
         }
+        
     return metrics, extras
 
 
@@ -651,7 +1192,7 @@ def _save_epoch_diagnostics(
     split_dir = output_dir / "diagnostics" / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    preds = (scores >= 0.5).astype(int)
+    preds = (scores >= CONF_THRESHOLD).astype(int)
     tn = int(np.sum((labels == 0) & (preds == 0)))
     fp = int(np.sum((labels == 0) & (preds == 1)))
     fn = int(np.sum((labels == 1) & (preds == 0)))
@@ -714,7 +1255,19 @@ def _evaluate_predictions(model: nn.Module, dataloader: DataLoader, device: torc
         for batch in dataloader:
             images = batch["image"].to(device, non_blocking=True)
             logits = model(images)
-            probs = torch.sigmoid(logits)
+            # 处理不同形状的 logits
+            if logits.ndim == 2 and logits.size(1) == 2:
+                # [B, 2] -> 使用 softmax 取第二列（睁眼概率）
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                logit_values = logits[:, 1]  # 使用睁眼类别的 logit
+            elif logits.ndim == 2 and logits.size(1) == 1:
+                # [B, 1] -> 使用 sigmoid
+                probs = torch.sigmoid(logits.squeeze(1))
+                logit_values = logits.squeeze(1)
+            else:
+                # [B] -> 使用 sigmoid
+                probs = torch.sigmoid(logits)
+                logit_values = logits
             for idx in range(images.size(0)):
                 results.append(
                     {
@@ -722,13 +1275,265 @@ def _evaluate_predictions(model: nn.Module, dataloader: DataLoader, device: torc
                         "video_name": batch["video_name"][idx],
                         "base_frame": batch["base_frame"][idx],
                         "label": int(batch["label"][idx].item()),
-                        "logit": float(logits[idx].detach().cpu().item()),
+                        "logit": float(logit_values[idx].detach().cpu().item()),
                         "prob_open": float(probs[idx].detach().cpu().item()),
                     }
                 )
     return results
 
+###############################################
+# 统一的可分性指标写入函数
+###############################################
+def log_all_separation_metrics(split, outputs, epoch, tb_writer, config):
+    if outputs is None or outputs["embeddings"] is None:
+        return
 
+    probs = outputs["probs"]
+    labels = outputs["labels"]
+    emb = outputs["embeddings"]
+    
+    # 限制样本数量，避免计算时间过长
+    MAX_SAMPLES_FOR_VIS = 10000  # 可视化最多使用10000个样本
+    MAX_SAMPLES_FOR_METRICS = 50000  # 指标计算最多使用50000个样本
+    
+    import numpy as np
+    n_samples = len(probs)
+    
+    # 对数据进行采样（如果需要）
+    if n_samples > MAX_SAMPLES_FOR_VIS:
+        # 随机采样，保持类别比例
+        indices = np.arange(n_samples)
+        np.random.seed(42)  # 固定随机种子，保证可复现
+        np.random.shuffle(indices)
+        vis_indices = indices[:MAX_SAMPLES_FOR_VIS]
+        vis_probs = probs[vis_indices]
+        vis_labels = labels[vis_indices]
+        vis_emb = emb[vis_indices]
+        LOGGER.info(f"[{split}] Sampling {MAX_SAMPLES_FOR_VIS} samples from {n_samples} for visualization")
+    else:
+        vis_probs = probs
+        vis_labels = labels
+        vis_emb = emb
+        vis_indices = np.arange(n_samples)
+    
+    if n_samples > MAX_SAMPLES_FOR_METRICS:
+        # 对指标计算也进行采样
+        indices = np.arange(n_samples)
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        metrics_indices = indices[:MAX_SAMPLES_FOR_METRICS]
+        metrics_probs = probs[metrics_indices]
+        metrics_labels = labels[metrics_indices]
+        metrics_emb = emb[metrics_indices]
+        LOGGER.info(f"[{split}] Sampling {MAX_SAMPLES_FOR_METRICS} samples from {n_samples} for metrics calculation")
+    else:
+        metrics_probs = probs
+        metrics_labels = labels
+        metrics_emb = emb
+
+    # 检查sklearn是否可用
+    try:
+        import sklearn
+        sklearn_available = True
+    except ImportError:
+        sklearn_available = False
+        LOGGER.warning("sklearn not available, skipping t-SNE and PCA visualizations")
+
+    import os
+    
+    # 1) t-SNE (需要sklearn，使用采样后的数据)
+    if sklearn_available:
+        try:
+            LOGGER.info(f"[{split}] Computing t-SNE for {len(vis_emb)} samples...")
+            tsne_path = os.path.join(config.output_dir, f"tsne/epoch_{epoch}.png")
+            os.makedirs(os.path.dirname(tsne_path), exist_ok=True)
+            plot_tsne_2d(vis_emb, vis_labels, tsne_path)
+            LOGGER.info(f"[{split}] t-SNE completed")
+        except Exception as e:
+            LOGGER.warning(f"Failed to plot t-SNE: {e}")
+    else:
+        LOGGER.debug("Skipping t-SNE visualization (sklearn not available)")
+
+    # 2) PCA 3D (需要sklearn，使用采样后的数据)
+    if sklearn_available:
+        try:
+            LOGGER.info(f"[{split}] Computing PCA 3D for {len(vis_emb)} samples...")
+            pca3d_path = os.path.join(config.output_dir, f"pca3d/epoch_{epoch}.png")
+            os.makedirs(os.path.dirname(pca3d_path), exist_ok=True)
+            plot_pca_3d(vis_emb, vis_labels, pca3d_path)
+            LOGGER.info(f"[{split}] PCA 3D completed")
+        except Exception as e:
+            LOGGER.warning(f"Failed to plot PCA 3D: {e}")
+    else:
+        LOGGER.debug("Skipping PCA 3D visualization (sklearn not available)")
+
+    # 3) 离群点（使用采样后的数据）
+    LOGGER.info(f"[{split}] Computing outliers for {len(metrics_emb)} samples...")
+    outliers = detect_outliers_mahalanobis(metrics_emb, metrics_labels)
+    csv_path = os.path.join(config.output_dir, "outliers.csv")
+    with open(csv_path, "w") as f:
+        f.write("index,label,distance\n")
+        for i,l,d in outliers:
+            f.write(f"{i},{l},{d}\n")
+    LOGGER.info(f"[{split}] Outliers computation completed")
+
+    # 4) 难例（使用采样后的数据）
+    LOGGER.info(f"[{split}] Computing hard samples...")
+    hard = detect_hard_samples(metrics_probs, metrics_labels)
+    csv_path = os.path.join(config.output_dir, "hard_samples.csv")
+    with open(csv_path, "w") as f:
+        f.write("index,prob,label\n")
+        for i,p,l in hard:
+            f.write(f"{i},{p},{l}\n")
+    LOGGER.info(f"[{split}] Hard samples computation completed")
+
+    # 5) 错标检测（使用采样后的数据）
+    LOGGER.info(f"[{split}] Computing mislabeled samples...")
+    wrong = detect_mislabeled(metrics_probs, metrics_labels, metrics_emb)
+    csv_path = os.path.join(config.output_dir, "mislabeled.csv")
+    with open(csv_path, "w") as f:
+        f.write("index,true,pred,prob\n")
+        for i,t,p,pr in wrong:
+            f.write(f"{i},{t},{p},{pr}\n")
+    LOGGER.info(f"[{split}] Mislabeled samples computation completed")
+
+    #-------------------------------------
+    # 基本统计 + 概率直方图（使用采样后的数据）
+    #-------------------------------------
+    LOGGER.info(f"[{split}] Computing histograms...")
+    hist0, _ = np.histogram(metrics_probs[metrics_labels == 0], bins=200, range=(0,1), density=True)
+    hist1, _ = np.histogram(metrics_probs[metrics_labels == 1], bins=200, range=(0,1), density=True)
+
+    #-------------------------------------
+    # 基础分布指标（KS / Hellinger / JS / ECE / Margin）
+    #-------------------------------------
+    LOGGER.info(f"[{split}] Computing distribution metrics...")
+    metrics = {}
+    metrics["ks_distance"] = ks_distance(metrics_probs, metrics_labels)
+    metrics["hellinger"] = hellinger_distance(hist0, hist1)
+    metrics["js_divergence"] = js_divergence(hist0, hist1)
+    metrics["ece"] = expected_calibration_error(metrics_probs, metrics_labels)
+    metrics["margin"] = margin_score(metrics_probs)
+
+    #-------------------------------------
+    # 贝叶斯误差 + 类间可分性（intra/inter/fisher/bhatt）
+    #-------------------------------------
+    LOGGER.info(f"[{split}] Computing class separation metrics...")
+    metrics["bayes_error"] = compute_bayes_error(metrics_probs, metrics_labels)
+    sep = compute_class_separation(metrics_emb, metrics_labels)
+    metrics["intra"] = sep["intra"]
+    metrics["inter"] = sep["inter"]
+    metrics["fisher"] = sep["fisher"]
+    metrics["bhattacharyya"] = sep["bhatta"]
+
+    #-------------------------------------
+    # PCA embedding 能量
+    #-------------------------------------
+    LOGGER.info(f"[{split}] Computing PCA energy...")
+    pca_energy = embedding_pca_energy(metrics_emb, k=5)
+    LOGGER.info(f"[{split}] All metrics computation completed")
+
+    #-------------------------------------
+    # 写入 TensorBoard
+    #-------------------------------------
+    for key, val in metrics.items():
+        tb_writer.add_scalar(f"{split}/{key}", val, epoch)
+
+    for i, e in enumerate(pca_energy):
+        tb_writer.add_scalar(f"{split}/pca_energy_{i}", e, epoch)
+
+def save_embeddings_for_projector(writer, emb, labels, epoch, projector_dir, split="val", tag="embedding", max_samples=50000):
+    """
+    Save embedding + metadata for TensorBoard Projector.
+    emb: numpy (N, D)
+    labels: numpy (N,)
+    max_samples: 限制保存的样本数量，避免内存问题
+    """
+    import os
+    
+    # 限制样本数量，避免内存问题
+    total_samples = min(emb.shape[0], len(labels))
+    if total_samples > max_samples:
+        # 随机采样
+        indices = np.random.choice(total_samples, max_samples, replace=False)
+        emb = emb[indices]
+        labels = labels[indices]
+        N = max_samples
+        print(f"[Projector] Sampling {N} samples from {total_samples} total samples for {split} embeddings (epoch {epoch})")
+    else:
+        N = total_samples
+        if emb.shape[0] != len(labels):
+            print(f"[Warning] embedding count {emb.shape[0]} != labels {len(labels)}, trimming to {N}")
+            emb = emb[:N]
+            labels = labels[:N]
+
+    # 检查并过滤无效值（NaN, Inf）
+    valid_mask = np.isfinite(emb).all(axis=1)
+    if not valid_mask.all():
+        invalid_count = (~valid_mask).sum()
+        print(f"[Projector] Warning: {invalid_count} invalid embeddings (NaN/Inf) detected, filtering them out")
+        emb = emb[valid_mask]
+        labels = labels[valid_mask]
+        N = len(emb)
+        print(f"[Projector] After filtering: {N} valid embeddings")
+    
+    if N == 0:
+        print(f"[Projector] Error: No valid embeddings to save for {split} (epoch {epoch})")
+        return
+    
+    emb_tensor = torch.tensor(emb, dtype=torch.float32)
+    
+    # 确保tensor和labels数量一致
+    assert emb_tensor.shape[0] == len(labels), f"Tensor shape {emb_tensor.shape[0]} != labels length {len(labels)}"
+    
+    # metadata file
+    metadata_path = os.path.join(projector_dir, f"{split}_metadata_epoch_{epoch}.tsv")
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, "w") as f:
+        f.write("label\n")
+        for l in labels:
+            f.write(f"{int(l)}\n")
+
+    # embedding variable name
+    var_name = f"{split}_emb_epoch_{epoch}"
+    
+    # write embedding
+    print(f"[Projector] Writing {N} {split} embeddings for epoch {epoch}...")
+    print(f"[Projector] Tensor shape: {emb_tensor.shape}, Labels length: {len(labels)}")
+    
+    # 确保metadata是列表且长度匹配
+    metadata_list = labels.tolist() if hasattr(labels, 'tolist') else [int(l) for l in labels]
+    
+    # 最终验证
+    if len(metadata_list) != emb_tensor.shape[0]:
+        print(f"[Projector] ERROR: Metadata length {len(metadata_list)} != tensor shape {emb_tensor.shape[0]}")
+        print(f"[Projector] Trimming to match tensor shape...")
+        min_len = min(len(metadata_list), emb_tensor.shape[0])
+        metadata_list = metadata_list[:min_len]
+        emb_tensor = emb_tensor[:min_len]
+        labels = labels[:min_len]
+        N = min_len
+        print(f"[Projector] After trimming: {N} embeddings")
+    
+    # 重新写入metadata文件，确保数量一致
+    with open(metadata_path, "w") as f:
+        f.write("label\n")
+        for l in labels:
+            f.write(f"{int(l)}\n")
+    
+    # 最终验证
+    assert emb_tensor.shape[0] == len(metadata_list) == len(labels), \
+        f"Final mismatch: tensor={emb_tensor.shape[0]}, metadata={len(metadata_list)}, labels={len(labels)}"
+    
+    writer.add_embedding(
+        emb_tensor,
+        metadata=metadata_list,
+        tag=f"{split}_epoch_{epoch}",
+        global_step=epoch
+    )
+
+    print(f"[Projector] Saved: {N} {split} embeddings for epoch {epoch} (tensor shape: {emb_tensor.shape})")
+    
 def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]:
     _setup_logging(config.output_dir, verbose=verbose)
     config_dict = config.to_dict()
@@ -743,6 +1548,56 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         LOGGER.warning("--use_amp requested but CUDA device is not available; proceeding without AMP.")
     tb_dir = config.output_dir
     tb_writer = SummaryWriter(log_dir=str(tb_dir))
+    
+    # 自动启动TensorBoard服务器
+    tb_process = None  # 在函数作用域内定义，确保后续可以访问
+    try:
+        import shutil
+        if shutil.which("tensorboard"):
+            # 查找可用端口
+            import socket
+            tb_port = 6006
+            for port in range(6006, 6010):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+                if result != 0:  # 端口未被占用
+                    tb_port = port
+                    break
+            
+            # 启动TensorBoard
+            tb_cmd = [
+                "tensorboard",
+                "--logdir", str(tb_dir),
+                # "--port", str(tb_port),
+                #"--host", "0.0.0.0",  # 允许外部访问
+            ]
+            tb_process = subprocess.Popen(
+                tb_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True  # 创建新的进程组，避免训练结束时被终止
+            )
+            LOGGER.info(f"TensorBoard started automatically at http://localhost:{tb_port}")
+            LOGGER.info(f"TensorBoard log directory: {tb_dir}")
+            
+            # 注册清理函数
+            def cleanup_tensorboard():
+                if tb_process and tb_process.poll() is None:
+                    tb_process.terminate()
+                    try:
+                        tb_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        tb_process.kill()
+            
+            atexit.register(cleanup_tensorboard)
+        else:
+            LOGGER.warning("TensorBoard not found in PATH. Install it with: pip install tensorboard")
+            LOGGER.info(f"To start TensorBoard manually, run: tensorboard --logdir {tb_dir}")
+    except Exception as e:
+        LOGGER.warning(f"Failed to start TensorBoard automatically: {e}")
+        LOGGER.info(f"To start TensorBoard manually, run: tensorboard --logdir {tb_dir}")
+    
     history_path = config.output_dir / "history.json"
     history: List[Dict[str, Any]] = []
     if history_path.exists():
@@ -805,6 +1660,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         token_mixer_layers=config.token_mixer_layers,
     )
     model = OCEC(model_config).to(device)
+    ema = EMA(model, decay=0.999)
     
     # Multi-GPU support using DataParallel
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
@@ -829,14 +1685,41 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     }
 
     pos_weight = _compute_pos_weight(splits["train"]).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # 可以选择使用 BCEWithLogitsLoss 或 FocalLabelSmoothCE
+    # 两者现在都兼容单个分数输出（[B] 或 [B, 1]）和两个类别输出（[B, 2]）
+    use_focal_loss = False  # 设置为 True 使用 FocalLabelSmoothCE，False 使用 BCEWithLogitsLoss
+    if use_focal_loss:
+        criterion = FocalLabelSmoothCE(smoothing=0.05, gamma=2.0)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     optimizer = torch.optim.AdamW(
         (param for param in model.parameters() if param.requires_grad),
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    
+    # 创建主调度器（ReduceLROnPlateau）
+    main_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2
+    )
+    
+    # 如果启用warmup，创建组合调度器
+    warmup_epochs = config.warmup_epochs
+    if warmup_epochs > 0:
+        # Warmup阶段：线性增加学习率从0到目标学习率
+        def warmup_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            return 1.0
+        
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+        scheduler = {"type": "warmup", "warmup": warmup_scheduler, "main": main_scheduler, "warmup_epochs": warmup_epochs}
+        LOGGER.info(f"Using warmup scheduler: {warmup_epochs} epochs of linear warmup, then ReduceLROnPlateau")
+    else:
+        scheduler = {"type": "main", "main": main_scheduler, "warmup_epochs": 0}
+        LOGGER.info("Using ReduceLROnPlateau scheduler (no warmup)")
+    
     scaler = _create_grad_scaler(amp_enabled)
 
     start_epoch = 1
@@ -890,7 +1773,16 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         if resume_payload.get("optimizer_state"):
             optimizer.load_state_dict(resume_payload["optimizer_state"])
         if resume_payload.get("scheduler_state"):
-            scheduler.load_state_dict(resume_payload["scheduler_state"])
+            # 恢复调度器状态
+            if scheduler["type"] == "warmup":
+                # 如果恢复时还在warmup阶段，恢复warmup调度器
+                if start_epoch <= scheduler["warmup_epochs"]:
+                    scheduler["warmup"].load_state_dict(resume_payload["scheduler_state"])
+                else:
+                    # 如果已经过了warmup阶段，恢复主调度器
+                    scheduler["main"].load_state_dict(resume_payload["scheduler_state"])
+            else:
+                scheduler["main"].load_state_dict(resume_payload["scheduler_state"])
         if resume_payload.get("scaler_state") and amp_enabled:
             scaler.load_state_dict(resume_payload["scaler_state"])
 
@@ -973,8 +1865,23 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             autocast_enabled=amp_enabled,
             progress_desc=f"Train {epoch}/{config.epochs}",
             collect_outputs=True,
+            use_focal_loss=use_focal_loss,
         )
+        # 只在特定epoch保存训练集embedding（每50个epoch或第一个epoch）
+        if (epoch == 1 or epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
+            LOGGER.info("Saving training embeddings for TensorBoard Projector...")
+            save_embeddings_for_projector(
+                tb_writer,
+                emb=train_outputs["embeddings"],
+                labels=train_outputs["labels"],
+                epoch=epoch,
+                projector_dir=config.output_dir,
+                split="train"
+            )
+            LOGGER.info("Training embeddings saved.")
         if val_loader:
+            LOGGER.info("Starting validation...")
+            ema.apply(model)
             val_metrics, val_outputs = _run_epoch(
                 model,
                 val_loader,
@@ -985,14 +1892,85 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 autocast_enabled=amp_enabled,
                 progress_desc=f"Val   {epoch}/{config.epochs}",
                 collect_outputs=True,
+                use_focal_loss=use_focal_loss,
             )
+            
+            if epoch % 50 == 0:
+                if val_outputs is not None and val_outputs["embeddings"] is not None:
+                    # ========= 错误样本蒙太奇 =========
+                    wrong = detect_mislabeled(val_outputs["probs"], val_outputs["labels"], val_outputs["embeddings"])
+
+                    wrong_paths = [ val_dataset.samples[idx].path for (idx,_,_,_) in wrong ]
+
+                    montage_path = os.path.join(config.output_dir, f"montage/mislabeled_epoch_{epoch}.png")
+                    os.makedirs(os.path.dirname(montage_path), exist_ok=True)
+                    create_montage(wrong_paths, montage_path, cols=12)
+
+                    # ========= 小眼睛聚类（子簇提取） =========
+                    cluster_dir = os.path.join(config.output_dir, f"clusters/epoch_{epoch}")
+                    os.makedirs(cluster_dir, exist_ok=True)
+
+                    val_image_paths = [
+                        s.path for s in val_dataset.samples 
+                        if s.label == 0    # 假设 0 = 闭眼，小眼睛专用
+                    ]
+
+                    # 聚类小眼睛（需要sklearn）
+                    try:
+                        cluster_small_eye(
+                            emb=val_outputs["embeddings"],
+                            labels=val_outputs["labels"],
+                            image_paths=val_image_paths,
+                            save_root=str(config.output_dir / f"clusters_epoch{epoch:04d}"),
+                            n_clusters=5,
+                        )
+                    except ImportError as e:
+                        LOGGER.warning(f"Skipping clustering (sklearn not available): {e}")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to cluster small eyes: {e}")
+                    
+                    # 双PCA可视化（需要sklearn）
+                    try:
+                        emb_raw = val_outputs["embeddings"]
+                        emb_arc = emb_raw / np.linalg.norm(emb_raw, axis=1, keepdims=True)
+
+                        dual_pca_path = os.path.join(config.output_dir, f"dual_pca/epoch_{epoch}.png")
+                        os.makedirs(os.path.dirname(dual_pca_path), exist_ok=True)
+                        plot_dual_pca(emb_raw, emb_arc, val_outputs["labels"], dual_pca_path)
+                    except ImportError as e:
+                        LOGGER.warning(f"Skipping dual PCA visualization (sklearn not available): {e}")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to plot dual PCA: {e}")
+                    
+                    save_embeddings_for_projector(
+                        tb_writer,
+                        emb=val_outputs["embeddings"],
+                        labels=val_outputs["labels"],
+                        epoch=epoch,
+                        projector_dir=config.output_dir,
+                        split="val"
+                    )
+    
+            ema.restore(model)
         else:
             val_metrics, val_outputs = None, None
-
-        if val_metrics:
-            scheduler.step(val_metrics["loss"])
+        if epoch % 10 == 0:
+            log_all_separation_metrics("train", train_outputs, epoch, tb_writer, config)
+            log_all_separation_metrics("val",   val_outputs,   epoch, tb_writer, config)     
+               
+        # 更新学习率调度器
+        if scheduler["type"] == "warmup" and epoch <= scheduler["warmup_epochs"]:
+            # Warmup阶段：使用LambdaLR线性增加学习率
+            scheduler["warmup"].step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            if epoch == scheduler["warmup_epochs"]:
+                LOGGER.info(f"Warmup completed. Learning rate: {current_lr:.6f}")
         else:
-            scheduler.step(train_metrics["loss"])
+            # Warmup结束后，使用ReduceLROnPlateau
+            if val_metrics:
+                scheduler["main"].step(val_metrics["loss"])
+            else:
+                scheduler["main"].step(train_metrics["loss"])
 
         record = {
             "epoch": epoch,
@@ -1041,7 +2019,11 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         # Get model state dict (unwrap DataParallel if needed)
         model_state = model.module.state_dict() if use_multi_gpu else model.state_dict()
         optimizer_state = optimizer.state_dict()
-        scheduler_state = scheduler.state_dict()
+        # 保存调度器状态
+        if scheduler["type"] == "warmup" and epoch <= scheduler["warmup_epochs"]:
+            scheduler_state = scheduler["warmup"].state_dict()
+        else:
+            scheduler_state = scheduler["main"].state_dict()
 
         epoch_payload = {
             **base_metadata,
@@ -1112,6 +2094,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             scaler=None,
             autocast_enabled=amp_enabled,
             progress_desc="Test",
+            use_focal_loss=use_focal_loss,
         )
     LOGGER.info("Test metrics: %s", json.dumps(test_metrics, indent=2) if test_metrics else "n/a")
     if test_metrics:
@@ -1150,6 +2133,17 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         json.dump(summary, fp, indent=2)
 
     tb_writer.close()
+    
+    # 关闭TensorBoard进程（如果还在运行）
+    if tb_process and tb_process.poll() is None:
+        LOGGER.info("Stopping TensorBoard server...")
+        tb_process.terminate()
+        try:
+            tb_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tb_process.kill()
+        LOGGER.info("TensorBoard server stopped.")
+    
     return summary
 
 
@@ -1200,11 +2194,23 @@ def predict_images(
             pil_image = Image.open(image_path).convert("RGB")
             tensor = eval_transform(pil_image).unsqueeze(0).to(device)
             logits = model(tensor)
-            prob = torch.sigmoid(logits)[0].item()
+            # 处理不同形状的 logits
+            if logits.ndim == 2 and logits.size(1) == 2:
+                # [1, 2] -> 使用 softmax 取第二列（睁眼概率）
+                prob = torch.softmax(logits, dim=1)[0, 1].item()
+                logit_value = logits[0, 1].item()  # 使用睁眼类别的 logit
+            elif logits.ndim == 2 and logits.size(1) == 1:
+                # [1, 1] -> 使用 sigmoid
+                prob = torch.sigmoid(logits.squeeze(1))[0].item()
+                logit_value = logits.squeeze(1)[0].item()
+            else:
+                # [1] -> 使用 sigmoid
+                prob = torch.sigmoid(logits)[0].item()
+                logit_value = logits[0].item()
             records.append(
                 {
                     "path": str(image_path),
-                    "logit": float(logits.item()),
+                    "logit": float(logit_value),
                     "prob_open": float(prob),
                 }
             )
@@ -1325,7 +2331,7 @@ def run_webcam_inference(
                 logits = model(tensor)
                 prob_open = torch.sigmoid(logits)[0].item()
 
-                label = LABEL_MAP[int(prob_open >= 0.5)]
+                label = LABEL_MAP[int(prob_open >= CONF_THRESHOLD)]
                 color = (0, 200, 0) if label == "open" else (50, 50, 255)
                 cv2.putText(
                     frame,
@@ -1501,7 +2507,7 @@ def run_webcam_inference_onnx(
             outputs = session.run([output_name], inputs)
             prob_open = float(outputs[0].flatten()[0])
 
-            label = LABEL_MAP[int(prob_open >= 0.5)]
+            label = LABEL_MAP[int(prob_open >= CONF_THRESHOLD)]
             color = (0, 200, 0) if label == "open" else (50, 50, 255)
             cv2.putText(
                 frame,
@@ -1659,6 +2665,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="auto")
     train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file.")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
+    train_parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for linear learning rate warmup (default: 5, set to 0 to disable).",
+    )
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -1754,6 +2766,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.device,
             resume_from=args.resume,
             use_amp=args.use_amp,
+            warmup_epochs=args.warmup_epochs,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":
