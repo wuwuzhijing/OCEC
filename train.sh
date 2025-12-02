@@ -20,14 +20,15 @@ export OCEC_ARGS="train \
     --data_root /ssddisk/guochuang/ocec/parquet_hq \
     --output_dir runs/ocec_hq \
     --epochs 1000 \
-    --batch_size 4096 \
+    --batch_size 1024 \
     --num_workers 16 \
     --train_ratio 0.8 \
     --val_ratio 0.2 \
     --image_size 32x64 \
-    --base_channels 64 \
-    --num_blocks 8 \
+    --base_channels 32 \
+    --num_blocks 4 \
     --arch_variant baseline \
+    --use_arcface \
     --seed 42 \
     --device auto"
 

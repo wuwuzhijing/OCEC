@@ -736,6 +736,7 @@ def _remove_batchnorm_from_onnx(model):
 class TrainConfig:
     data_root: Path
     output_dir: Path
+    use_arcface: bool = False
     epochs: int = 30
     batch_size: int = 32
     lr: float = 1e-4
@@ -957,7 +958,7 @@ def _run_epoch(
     autocast_enabled: bool = False,
     progress_desc: Optional[str] = None,
     collect_outputs: bool = False,
-    use_focal_loss: bool = False,  # 标记是否使用FocalLabelSmoothCE
+    use_arcface: bool = False,
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
@@ -990,13 +991,19 @@ def _run_epoch(
         
         with _autocast(autocast_enabled):
             logits, embedding = model(images, labels=labels, return_embedding=True)
-            # 处理不同形状的logits：如果是[B, 2]形状（arcface输出），提取正类logit用于BCE
-            if logits.ndim == 2 and logits.shape[1] == 2:
-                # arcface输出[B, 2]，提取正类（类别1）的logit用于BCE损失
-                logits_bce = logits[:, 1]
+            if use_arcface:
+                # ArcFace输出[B, 2]的logits，使用CrossEntropyLoss，标签需要是长整型
+                loss = criterion(logits, labels.long())
+                probs = torch.softmax(logits, dim=1)[:, 1]
             else:
-                logits_bce = logits
-            loss = criterion(logits_bce, labels.float())
+                # BCE损失：处理不同形状的logits
+                if logits.ndim == 2 and logits.shape[1] == 2:
+                    # arcface输出[B, 2]，提取正类logit用于BCE
+                    logits_bce = logits[:, 1]
+                else:
+                    logits_bce = logits
+                loss = criterion(logits_bce, labels.float())
+                probs = torch.sigmoid(logits_bce)
 
         if train_mode:
             if scaler is not None:
@@ -1013,35 +1020,8 @@ def _run_epoch(
         stats["loss"] += loss.detach().item() * batch_size
         stats["samples"] += batch_size
 
-
-        # ---- 处理不同形状的 logits，恢复单通道开眼概率 ----
-        # 如果使用FocalLabelSmoothCE，需要与训练时保持一致的计算方式
-        if use_focal_loss and logits.ndim == 1:
-            # FocalLabelSmoothCE训练时使用: [-logit, logit] -> softmax -> [p_close, p_open]
-            # 评估时也应该使用相同方式
-            logits_2d = torch.stack([-logits, logits], dim=1)  # [B, 2]
-            probs = torch.softmax(logits_2d, dim=1)[:, 1]      # 取睁眼概率
-        elif use_focal_loss and logits.ndim == 2 and logits.size(1) == 1:
-            # [B, 1] -> 转换为 [B, 2] 然后softmax
-            logits_1d = logits.squeeze(1)
-            logits_2d = torch.stack([-logits_1d, logits_1d], dim=1)
-            probs = torch.softmax(logits_2d, dim=1)[:, 1]
-        elif logits.ndim == 2 and logits.size(1) == 2:
-            # [B, 2] -> 使用 softmax 取第二列（睁眼概率）
-            # ArcFace输出的logits可能很大（乘以s=30），需要先归一化或直接softmax
-            probs = torch.softmax(logits, dim=1)[:, 1]   # shape: [B]
-        elif logits.ndim == 2 and logits.size(1) == 1:
-            # [B, 1] -> 使用 sigmoid
-            probs = torch.sigmoid(logits.squeeze(1))     # shape: [B]
-        else:
-            # [B] -> 使用 sigmoid (BCEWithLogitsLoss的情况)
-            probs = torch.sigmoid(logits)                # shape: [B]
-        
-        # 确保probs在有效范围内 [0, 1]
         probs = torch.clamp(probs, min=0.0, max=1.0)
-
-        # 单通道二分类决策阈值
-        preds = (probs >= CONF_THRESHOLD).long()                # shape: [B]
+        preds = (probs >= CONF_THRESHOLD).long()
         
         labels_int = labels.long()
         stats["tp"] += ((preds == 1) & (labels_int == 1)).sum().item()
@@ -1092,7 +1072,7 @@ def _run_epoch(
             batch_fn = ((preds == 0) & (labels_int == 1)).sum().item()
             batch_tn = ((preds == 0) & (labels_int == 0)).sum().item()
             LOGGER.info(
-                f"Val batch debug - logits shape: {logits.shape}, use_focal_loss: {use_focal_loss}, "
+                f"Val batch debug - logits shape: {logits.shape},"
                 f"logits ({logits_info}), "
                 f"probs: mean={probs_mean:.3f}, std={probs_std:.3f}, "
                 f"range=[{probs_min:.3f}, {probs_max:.3f}], "
@@ -1658,6 +1638,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         head_variant=config.head_variant,
         token_mixer_grid=config.token_mixer_grid,
         token_mixer_layers=config.token_mixer_layers,
+        use_arcface=config.use_arcface,
     )
     model = OCEC(model_config).to(device)
     ema = EMA(model, decay=0.999)
@@ -1685,11 +1666,9 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     }
 
     pos_weight = _compute_pos_weight(splits["train"]).to(device)
-    # 可以选择使用 BCEWithLogitsLoss 或 FocalLabelSmoothCE
-    # 两者现在都兼容单个分数输出（[B] 或 [B, 1]）和两个类别输出（[B, 2]）
-    use_focal_loss = False  # 设置为 True 使用 FocalLabelSmoothCE，False 使用 BCEWithLogitsLoss
-    if use_focal_loss:
-        criterion = FocalLabelSmoothCE(smoothing=0.05, gamma=2.0)
+
+    if config.use_arcface:
+        criterion = torch.nn.CrossEntropyLoss()
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -1865,7 +1844,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             autocast_enabled=amp_enabled,
             progress_desc=f"Train {epoch}/{config.epochs}",
             collect_outputs=True,
-            use_focal_loss=use_focal_loss,
+            use_arcface=config.use_arcface,
         )
         # 只在特定epoch保存训练集embedding（每50个epoch或第一个epoch）
         if (epoch == 1 or epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
@@ -1892,7 +1871,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 autocast_enabled=amp_enabled,
                 progress_desc=f"Val   {epoch}/{config.epochs}",
                 collect_outputs=True,
-                use_focal_loss=use_focal_loss,
+                use_arcface=config.use_arcface,
             )
             
             if epoch % 50 == 0:
@@ -2094,7 +2073,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             scaler=None,
             autocast_enabled=amp_enabled,
             progress_desc="Test",
-            use_focal_loss=use_focal_loss,
+            use_arcface=config.use_arcface,
         )
     LOGGER.info("Test metrics: %s", json.dumps(test_metrics, indent=2) if test_metrics else "n/a")
     if test_metrics:
@@ -2574,7 +2553,26 @@ def export_to_onnx(
             self.base_model = base_model
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            logits = self.base_model(x)
+            # 导出时禁用 arcface，使用原始 head 输出
+            # 临时保存原始 use_arcface 状态
+            original_use_arcface = self.base_model.use_arcface
+            self.base_model.use_arcface = False
+            
+            # 调用模型，不使用 arcface
+            logits = self.base_model(x, labels=None, return_embedding=False)
+            
+            # 恢复原始状态
+            self.base_model.use_arcface = original_use_arcface
+            
+            # 处理不同形状的 logits
+            if logits.ndim == 2 and logits.shape[1] == 2:
+                # 如果是 [B, 2] 形状（不应该发生，但为了安全），取正类 logit
+                logits = logits[:, 1]
+            elif logits.ndim == 2 and logits.shape[1] == 1:
+                # 如果是 [B, 1]，squeeze 成 [B]
+                logits = logits.squeeze(1)
+            
+            # 对单个 logit 应用 sigmoid 得到概率
             return torch.sigmoid(logits)
 
     export_base = copy.deepcopy(model)
@@ -2665,6 +2663,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="auto")
     train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file.")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
+    train_parser.add_argument(
+        "--use_arcface",
+        action="store_true",
+        help="Use ArcFace loss instead of BCE loss for training.",
+    )
     train_parser.add_argument(
         "--warmup_epochs",
         type=int,
@@ -2767,6 +2770,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             resume_from=args.resume,
             use_amp=args.use_amp,
             warmup_epochs=args.warmup_epochs,
+            use_arcface=args.use_arcface,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

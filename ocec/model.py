@@ -44,6 +44,7 @@ class ModelConfig:
     head_variant: str = "auto"
     token_mixer_grid: tuple[int, int] = (2, 3)
     token_mixer_layers: int = 2
+    use_arcface: bool = False
 
 
 class _SepConvBlock(nn.Module):
@@ -352,7 +353,8 @@ class OCEC(nn.Module):
     def __init__(self, config: Optional[ModelConfig] = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
-        self.use_arcface = False
+        self.use_arcface = self.config.use_arcface
+        print(f"use_arcface: {self.use_arcface}")
         base = self.config.base_channels
         num_blocks = max(1, self.config.num_blocks)
         variant = (self.config.arch_variant or "baseline").lower()
