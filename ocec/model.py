@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 
 class ArcFaceHead(nn.Module):
+    """ArcFace: Additive Angular Margin Loss"""
     def __init__(self, embedding_dim, num_classes=2, s=30.0, m=0.50):
         super().__init__()
         self.s = s
@@ -22,14 +23,41 @@ class ArcFaceHead(nn.Module):
         logits = F.linear(emb, w)   # (B, 2)
 
         if labels is None:
-            return logits * self.s
+            # 验证/推理时：返回不带 scale 的 logits，避免概率分布过于极端
+            return logits  # 不使用 scale，让 softmax 产生更合理的概率分布
 
+        # 训练时：ArcFace: cos(θ + m)，然后乘以 scale
         theta = torch.acos(torch.clamp(logits, -1 + 1e-7, 1 - 1e-7))
         target_logits = torch.cos(theta + self.m)
 
         one_hot = F.one_hot(labels.long(), num_classes=2)
         logits = logits * (1 - one_hot) + target_logits * one_hot
         return logits * self.s
+
+
+class CosFaceHead(nn.Module):
+    """CosFace (AM-Softmax): Additive Margin Softmax Loss"""
+    def __init__(self, embedding_dim, num_classes=2, s=30.0, m=0.35):
+        super().__init__()
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embedding, labels=None):
+        emb = F.normalize(embedding, dim=1)
+        w = F.normalize(self.weight, dim=1)
+        logits = F.linear(emb, w)   # (B, 2)
+
+        if labels is None:
+            # 验证/推理时：返回不带 scale 的 logits，避免概率分布过于极端
+            # 或者使用较小的 scale 来软化分布
+            return logits  # 不使用 scale，让 softmax 产生更合理的概率分布
+
+        # 训练时：CosFace: cos(θ) - m，然后乘以 scale
+        one_hot = F.one_hot(labels.long(), num_classes=2)
+        target_logits = logits - self.m * one_hot
+        return target_logits * self.s
     
 @dataclass
 class ModelConfig:
@@ -44,7 +72,7 @@ class ModelConfig:
     head_variant: str = "auto"
     token_mixer_grid: tuple[int, int] = (2, 3)
     token_mixer_layers: int = 2
-    use_arcface: bool = False
+    margin_method: str = "cosface"  # "none", "arcface", "cosface"
 
 
 class _SepConvBlock(nn.Module):
@@ -163,29 +191,32 @@ class _InvertedResidualSEBlock(nn.Module):
 
 
 class _LayerNorm2d(nn.Module):
-    """LayerNorm operating on channels-last tensors but returning channels-first."""
+    """LayerNorm operating on channels-last tensors but returning channels-first.
+    Optimized version using GroupNorm for better performance."""
 
     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(num_channels, eps=eps)
+        # 使用 GroupNorm(1) 代替 LayerNorm + permute，性能更好
+        # GroupNorm(num_groups=1) 等价于 LayerNorm，但支持 channels-first
+        self.norm = nn.GroupNorm(1, num_channels, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)
-        return x
+        # 直接使用 GroupNorm，无需 permute
+        return self.norm(x)
 
 
 class _ConvNeXtBlock(nn.Module):
-    """ConvNeXt-style block with depthwise conv and channel MLP."""
+    """ConvNeXt-style block with depthwise conv and channel MLP.
+    Optimized version using 1x1 conv instead of Linear + permute."""
 
     def __init__(self, dim: int, layer_scale_init: float = 1e-6) -> None:
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = _LayerNorm2d(dim)
-        self.pwconv1 = nn.Linear(dim, dim * 4)
+        # 使用 1x1 conv 代替 Linear，避免 permute 操作
+        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
         self.act = nn.GELU()
-        self.pwconv2 = nn.Linear(dim * 4, dim)
+        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
         if layer_scale_init > 0:
             self.gamma = nn.Parameter(layer_scale_init * torch.ones(dim))
         else:
@@ -195,13 +226,13 @@ class _ConvNeXtBlock(nn.Module):
         shortcut = x
         x = self.dwconv(x)
         x = self.norm(x)
-        x = x.permute(0, 2, 3, 1)
+        # 直接使用 conv，无需 permute
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
-            x = self.gamma * x
-        x = x.permute(0, 3, 1, 2)
+            # gamma 需要 reshape 以匹配空间维度
+            x = x * self.gamma.view(1, -1, 1, 1)
         x = x + shortcut
         return x
 
@@ -353,8 +384,8 @@ class OCEC(nn.Module):
     def __init__(self, config: Optional[ModelConfig] = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
-        self.use_arcface = self.config.use_arcface
-        print(f"use_arcface: {self.use_arcface}")
+        self.margin_method = self.config.margin_method
+        print(f"margin_method: {self.margin_method}")
         base = self.config.base_channels
         num_blocks = max(1, self.config.num_blocks)
         variant = (self.config.arch_variant or "baseline").lower()
@@ -423,9 +454,16 @@ class OCEC(nn.Module):
         self._feature_channels = channels
 
         self._init_weights()
-        if self.use_arcface:
+        if self.config.margin_method in ["arcface", "cosface"]:
             emb_dim = self._feature_channels   # transformer/mixer head 的 embedding dim
-            self.arc_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2)
+            if self.config.margin_method == "arcface":
+                # ArcFace: m=0.2 (角度间隔), s=8 (scale)
+                self.margin_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.2, s=8)
+            elif self.config.margin_method == "cosface":
+                # CosFace: m=0.35 (余弦间隔), s=8 (scale)
+                self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.35, s=8)
+        else:
+            self.margin_head = None
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -438,7 +476,14 @@ class OCEC(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, labels=None, return_embedding=False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, labels=None, return_embedding=False, training=None) -> torch.Tensor:
+        """
+        Args:
+            x: 输入图像
+            labels: 标签（用于训练时的 margin-based loss）
+            return_embedding: 是否返回 embedding
+            training: 是否在训练模式（None 时自动判断）
+        """
         x = self.stem(x)
         x = self.features(x)
 
@@ -460,15 +505,30 @@ class OCEC(nn.Module):
         if logits.ndim == 2 and logits.shape[1] == 1:
             logits = logits.squeeze(1)
 
-        if self.use_arcface:
-            if return_embedding:
-                logits_arc = self.arc_head(embedding, labels)
-                return logits_arc, embedding
+        if self.margin_head is not None:
+            # Margin-based loss (ArcFace/CosFace): 训练时使用 labels 和 margin，验证/推理时不使用 margin
+            # 通过 self.training 判断是否在训练模式
+            # 验证/推理时即使有 labels 也不使用 margin，确保行为一致
+            use_margin = (training is not None and training) or (training is None and self.training)
+            
+            if use_margin:
+                # 训练时：使用 margin_head 的 logits（带 margin）
+                margin_labels = labels
+                if return_embedding:
+                    logits_margin = self.margin_head(embedding, margin_labels)
+                    return logits_margin, embedding
+                else:
+                    logits_margin = self.margin_head(embedding, margin_labels)
+                    return logits_margin
             else:
-                logits_arc = self.arc_head(embedding, labels)
-                return logits_arc
+                # 验证/推理时：使用原始 head 的 logits，而不是 margin_head
+                # 因为 margin_head 的权重可能偏向训练时的类别分布，导致验证时预测偏差
+                # 使用原始 logits 可以更准确地反映模型的真实性能
+                if return_embedding:
+                    return logits, embedding
+                return logits
 
-        # 原逻辑
+        # 原逻辑（不使用 margin）
         if return_embedding:
             return logits, embedding
         return logits

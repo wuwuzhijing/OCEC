@@ -1,5 +1,0 @@
-- [ ] 增加Arcface，拉开类间距
-- [ ] 加入PCA、UMAP和T-SNE等类间差统计
-- [ ] 排查val的recall和f1几乎不变的问题
-  - 日志文件: [train_20251201_174250.log](../../logs/train/hq_data/train_20251201_174250.log)
-- [ ] 撰写分类训练过程中收集的指标文档

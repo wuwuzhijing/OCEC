@@ -127,24 +127,28 @@ def plot_tsne_2d(emb, labels, save_path):
     try:
         from sklearn.manifold import TSNE
     except ImportError as e:
-        raise ImportError(f"sklearn is required for t-SNE visualization. Install it with: pip install scikit-learn. Original error: {e}")
+        raise ImportError(
+            "sklearn is required for t-SNE visualization. "
+            "Install it with: pip install scikit-learn. "
+            f"Original error: {e}"
+        )
     
     import matplotlib.pyplot as plt
     import numpy as np
-
+    
     try:
         tsne = TSNE(n_components=2, learning_rate='auto', init='pca')
         emb_2d = tsne.fit_transform(emb)
-
-        plt.figure(figsize=(6,6))
-        for c in [0,1]:
+    
+        plt.figure(figsize=(6, 6))
+        for c in [0, 1]:
             idx = np.where(labels == c)
-            plt.scatter(emb_2d[idx,0], emb_2d[idx,1], s=6, alpha=0.6, label=str(c))
+            plt.scatter(emb_2d[idx, 0], emb_2d[idx, 1], s=6, alpha=0.6, label=str(c))
         plt.legend()
         plt.title("t-SNE 2D Embedding")
         plt.savefig(save_path, dpi=160)
         plt.close()
-    except Exception as e:
+    except Exception:
         plt.close()  # 确保关闭图形
         raise
 
@@ -167,7 +171,7 @@ def plot_pca_3d(emb, labels, save_path):
         raise ImportError("sklearn is required for PCA visualization. Install it with: pip install scikit-learn")
     
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     import numpy as np
 
     pca = PCA(n_components=3)
@@ -736,7 +740,7 @@ def _remove_batchnorm_from_onnx(model):
 class TrainConfig:
     data_root: Path
     output_dir: Path
-    use_arcface: bool = False
+    margin_method: str = "cosface"  # "none", "arcface", "cosface"
     epochs: int = 30
     batch_size: int = 32
     lr: float = 1e-4
@@ -756,6 +760,7 @@ class TrainConfig:
     token_mixer_layers: int = 2
     device: str = "auto"
     resume_from: Optional[Path] = None
+    pretrain_from: Optional[Path] = None  # 预训练权重路径（只加载模型权重，不恢复训练状态）
     use_amp: bool = False
     warmup_epochs: int = 5  # Warmup阶段的epoch数，0表示不使用warmup
 
@@ -767,6 +772,8 @@ class TrainConfig:
         data["token_mixer_grid"] = list(self.token_mixer_grid)
         if self.resume_from is not None:
             data["resume_from"] = str(self.resume_from)
+        if self.pretrain_from is not None:
+            data["pretrain_from"] = str(self.pretrain_from)
         return data
 
 
@@ -958,7 +965,8 @@ def _run_epoch(
     autocast_enabled: bool = False,
     progress_desc: Optional[str] = None,
     collect_outputs: bool = False,
-    use_arcface: bool = False,
+    margin_method: str = "cosface",  # "none", "arcface", "cosface"
+    ema: Optional["EMA"] = None,     # 可选的 EMA 对象，用于在训练阶段更新滑动平均权重
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
@@ -991,19 +999,96 @@ def _run_epoch(
         
         with _autocast(autocast_enabled):
             logits, embedding = model(images, labels=labels, return_embedding=True)
-            if use_arcface:
-                # ArcFace输出[B, 2]的logits，使用CrossEntropyLoss，标签需要是长整型
-                loss = criterion(logits, labels.long())
-                probs = torch.softmax(logits, dim=1)[:, 1]
+            use_margin = margin_method in ["arcface", "cosface"]
+            if use_margin:
+                # 损失函数使用带 margin 的 logits（训练时）
+                # 验证时，如果 logits 不是 [B, 2] 形状，说明使用的是原始 head，需要特殊处理
+                if train_mode:
+                    # 训练时：使用 CrossEntropyLoss，logits 应该是 [B, 2] 形状
+                    loss = criterion(logits, labels.long())
+                else:
+                    # 验证时：根据 logits 形状选择合适的损失函数
+                    if logits.ndim == 2 and logits.size(1) == 2:
+                        # [B, 2] 形状：使用 CrossEntropyLoss
+                        loss = criterion(logits, labels.long())
+                    else:
+                        # [B] 或 [B, 1] 形状：使用 BCEWithLogitsLoss
+                        logits_bce = logits.squeeze(1) if logits.ndim == 2 and logits.size(1) == 1 else logits
+                        # 创建一个临时的 BCE 损失函数（不使用 pos_weight，因为验证时不需要）
+                        bce_criterion = nn.BCEWithLogitsLoss()
+                        loss = bce_criterion(logits_bce, labels.float())
+                
+                # 计算指标时，训练和验证都使用 margin_head（labels=None，不应用 margin）
+                # 关键修复：确保训练和验证使用同一个分类器，指标计算方式一致
+                if train_mode:
+                    # 训练时：使用 margin_head 的 logits（labels=None，不应用 margin）用于指标计算
+                    # 这样训练和验证的指标计算方式一致，更准确反映模型性能
+                    with torch.no_grad():
+                        # 获取 margin_head 的 logits（labels=None 时不应用 margin）
+                        # 注意：需要从模型内部获取 margin_head，支持 DataParallel
+                        if hasattr(model, 'module'):  # DataParallel 包装
+                            margin_head = model.module.margin_head
+                        else:
+                            margin_head = model.margin_head
+                        
+                        if margin_head is not None:
+                            # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
+                            logits_no_margin = margin_head(embedding, labels=None)  # (B, 2)，范围 [-1, 1]
+                            # 应用 scale 以匹配训练时的 logits 范围
+                            logits_no_margin_scaled = logits_no_margin * margin_head.s  # (B, 2)，范围约 [-s, s]
+                            # 使用 softmax 计算概率
+                            probs = torch.softmax(logits_no_margin_scaled, dim=1)[:, 1]
+                            logits_for_debug = logits_no_margin_scaled
+                        else:
+                            # 如果没有 margin_head（不应该发生），回退到原始 logits
+                            LOGGER.warning("Training: margin_method is set but margin_head is None, using original logits")
+                            if logits.ndim == 2 and logits.size(1) == 2:
+                                probs = torch.softmax(logits, dim=1)[:, 1]
+                            else:
+                                logits_bce = logits.squeeze(1) if logits.ndim == 2 and logits.size(1) == 1 else logits
+                                probs = torch.sigmoid(logits_bce)
+                            logits_for_debug = logits
+                else:
+                    # 验证时：使用 margin_head 的 logits（labels=None，不应用 margin，但使用同一个分类器）
+                    # 关键修复：训练和验证必须使用同一个分类器（margin_head），否则会导致指标不一致
+                    # 训练时：margin_head(embedding, labels) -> 带 margin 和 scale 的 logits
+                    # 验证时：margin_head(embedding, labels=None) -> 不带 margin 但带 scale 的 logits
+                    with torch.no_grad():
+                        # 获取 margin_head 的 logits（labels=None 时不应用 margin）
+                        # 注意：需要从模型内部获取 margin_head，支持 DataParallel
+                        if hasattr(model, 'module'):  # DataParallel 包装
+                            margin_head = model.module.margin_head
+                        else:
+                            margin_head = model.margin_head
+                        
+                        if margin_head is not None:
+                            # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
+                            logits_margin = margin_head(embedding, labels=None)  # (B, 2)，范围 [-1, 1]
+                            # 应用 scale 以匹配训练时的 logits 范围
+                            logits_margin_scaled = logits_margin * margin_head.s  # (B, 2)，范围约 [-s, s]
+                            # 使用 softmax 计算概率
+                            probs = torch.softmax(logits_margin_scaled, dim=1)[:, 1]
+                            logits_for_debug = logits_margin_scaled
+                        else:
+                            # 如果没有 margin_head（不应该发生，因为 use_margin=True），回退到原始逻辑
+                            LOGGER.warning("Validation: margin_method is set but margin_head is None, using original logits")
+                            if logits.ndim == 2 and logits.size(1) == 2:
+                                probs = torch.softmax(logits, dim=1)[:, 1]
+                            elif logits.ndim == 2 and logits.size(1) == 1:
+                                probs = torch.sigmoid(logits.squeeze(1))
+                            elif logits.ndim == 1:
+                                probs = torch.sigmoid(logits)
+                            else:
+                                probs = torch.sigmoid(logits.squeeze() if logits.ndim > 1 else logits)
+                            logits_for_debug = logits
             else:
-                # BCE损失：处理不同形状的logits
                 if logits.ndim == 2 and logits.shape[1] == 2:
-                    # arcface输出[B, 2]，提取正类logit用于BCE
                     logits_bce = logits[:, 1]
                 else:
                     logits_bce = logits
                 loss = criterion(logits_bce, labels.float())
                 probs = torch.sigmoid(logits_bce)
+                logits_for_debug = logits
 
         if train_mode:
             if scaler is not None:
@@ -1013,8 +1098,9 @@ def _run_epoch(
             else:
                 loss.backward()
                 optimizer.step()
-                if train_mode and ema is not None:
-                    ema.update(model)
+            # 仅在训练阶段且提供了 EMA 对象时更新 EMA 权重
+            if ema is not None:
+                ema.update(model)
 
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
@@ -1029,12 +1115,16 @@ def _run_epoch(
         stats["fp"] += ((preds == 1) & (labels_int == 0)).sum().item()
         stats["fn"] += ((preds == 0) & (labels_int == 1)).sum().item()
         
-        # 调试信息：检查logits和probs的分布（仅在验证时且第一个batch）
-        if not train_mode and stats["samples"] == batch_size:
-            # 获取原始logits用于调试
-            if logits.ndim == 2 and logits.size(1) == 2:
-                logits_col0 = logits[:, 0].detach()  # 闭眼类别的logit
-                logits_col1 = logits[:, 1].detach()  # 睁眼类别的logit
+        # 调试信息：检查logits和probs的分布（训练和验证时都输出第一个batch）
+        if stats["samples"] == batch_size:
+            # 获取用于计算概率的 logits 用于调试（训练时是 logits_no_margin，验证时是 logits）
+            # 如果 logits_for_debug 未定义（不应该发生），使用原始 logits
+            if 'logits_for_debug' not in locals():
+                logits_for_debug = logits
+            debug_logits = logits_for_debug
+            if debug_logits.ndim == 2 and debug_logits.size(1) == 2:
+                logits_col0 = debug_logits[:, 0].detach()  # 闭眼类别的logit
+                logits_col1 = debug_logits[:, 1].detach()  # 睁眼类别的logit
                 logits_debug = logits_col1  # 用于显示睁眼类别的logit
                 logits_col0_mean = logits_col0.mean().item()
                 logits_col0_std = logits_col0.std().item()
@@ -1050,11 +1140,11 @@ def _run_epoch(
                     f"col1: mean={logits_col1_mean:.3f}, std={logits_col1_std:.3f}, "
                     f"range=[{logits_col1_min:.3f}, {logits_col1_max:.3f}]"
                 )
-            elif logits.ndim == 2 and logits.size(1) == 1:
-                logits_debug = logits.squeeze(1).detach()
+            elif debug_logits.ndim == 2 and debug_logits.size(1) == 1:
+                logits_debug = debug_logits.squeeze(1).detach()
                 logits_info = "single column [B, 1]"
             else:
-                logits_debug = logits.detach()
+                logits_debug = debug_logits.detach()
                 logits_info = "single dimension [B]"
             
             logits_mean = logits_debug.mean().item()
@@ -1071,8 +1161,9 @@ def _run_epoch(
             batch_fp = ((preds == 1) & (labels_int == 0)).sum().item()
             batch_fn = ((preds == 0) & (labels_int == 1)).sum().item()
             batch_tn = ((preds == 0) & (labels_int == 0)).sum().item()
+            split_name = "Train" if train_mode else "Val"
             LOGGER.info(
-                f"Val batch debug - logits shape: {logits.shape},"
+                f"{split_name} batch debug - logits shape: {debug_logits.shape}, "
                 f"logits ({logits_info}), "
                 f"probs: mean={probs_mean:.3f}, std={probs_std:.3f}, "
                 f"range=[{probs_min:.3f}, {probs_max:.3f}], "
@@ -1271,7 +1362,7 @@ def log_all_separation_metrics(split, outputs, epoch, tb_writer, config):
     probs = outputs["probs"]
     labels = outputs["labels"]
     emb = outputs["embeddings"]
-    
+
     # 限制样本数量，避免计算时间过长
     MAX_SAMPLES_FOR_VIS = 10000  # 可视化最多使用10000个样本
     MAX_SAMPLES_FOR_METRICS = 50000  # 指标计算最多使用50000个样本
@@ -1421,6 +1512,88 @@ def log_all_separation_metrics(split, outputs, epoch, tb_writer, config):
 
     for i, e in enumerate(pca_energy):
         tb_writer.add_scalar(f"{split}/pca_energy_{i}", e, epoch)
+    
+    #-------------------------------------
+    # 保存类间分离效果可视化图
+    #-------------------------------------
+    try:
+        LOGGER.info(f"[{split}] Saving class separation visualization...")
+        sep_vis_path = os.path.join(config.output_dir, f"class_separation/{split}_epoch_{epoch}.png")
+        os.makedirs(os.path.dirname(sep_vis_path), exist_ok=True)
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f"{split.capitalize()} Class Separation Metrics (Epoch {epoch})", fontsize=14, fontweight='bold')
+        
+        # 1. Intra-class vs Inter-class Distance
+        ax1 = axes[0, 0]
+        ax1.bar(['Intra-class\nDistance', 'Inter-class\nDistance'], 
+                [sep["intra"], sep["inter"]], 
+                color=['#ff7f7f', '#7f7fff'], alpha=0.7)
+        ax1.set_ylabel('Distance', fontsize=11)
+        ax1.set_title('Intra vs Inter-class Distance', fontsize=12, fontweight='bold')
+        ax1.grid(axis='y', alpha=0.3)
+        # 添加数值标签
+        ax1.text(0, sep["intra"], f'{sep["intra"]:.3f}', ha='center', va='bottom', fontsize=10)
+        ax1.text(1, sep["inter"], f'{sep["inter"]:.3f}', ha='center', va='bottom', fontsize=10)
+        
+        # 2. Fisher Ratio (类间分离度)
+        ax2 = axes[0, 1]
+        fisher_val = sep["fisher"]
+        ax2.barh(['Fisher Ratio'], [fisher_val], color='#7fbf7f', alpha=0.7)
+        ax2.set_xlabel('Fisher Ratio (Inter / Intra)', fontsize=11)
+        ax2.set_title(f'Class Separability\n(Higher = Better Separation)', fontsize=12, fontweight='bold')
+        ax2.grid(axis='x', alpha=0.3)
+        # 添加数值标签
+        ax2.text(fisher_val, 0, f'{fisher_val:.3f}', ha='left' if fisher_val < ax2.get_xlim()[1] * 0.5 else 'right', 
+                va='center', fontsize=12, fontweight='bold')
+        
+        # 3. Bhattacharyya Distance
+        ax3 = axes[1, 0]
+        bhatt_val = sep["bhatta"]
+        ax3.barh(['Bhattacharyya\nDistance'], [bhatt_val], color='#bf7fbf', alpha=0.7)
+        ax3.set_xlabel('Distance', fontsize=11)
+        ax3.set_title('Distribution Distance\n(Higher = More Separated)', fontsize=12, fontweight='bold')
+        ax3.grid(axis='x', alpha=0.3)
+        # 添加数值标签
+        ax3.text(bhatt_val, 0, f'{bhatt_val:.3f}', ha='left' if bhatt_val < ax3.get_xlim()[1] * 0.5 else 'right', 
+                va='center', fontsize=12, fontweight='bold')
+        
+        # 4. 综合指标对比（归一化显示）
+        ax4 = axes[1, 1]
+        # 归一化到 [0, 1] 范围用于可视化（使用相对值）
+        max_inter = max(sep["inter"], 1.0)  # 避免除零
+        max_intra = max(sep["intra"], 1.0)
+        max_fisher = max(fisher_val, 1.0)
+        max_bhatt = max(bhatt_val, 1.0)
+        
+        normalized_values = {
+            'Inter/Intra\nRatio': sep["inter"] / max_inter if max_intra > 0 else 0,
+            'Fisher Ratio': fisher_val / max_fisher,
+            'Bhattacharyya': bhatt_val / max_bhatt,
+        }
+        
+        bars = ax4.barh(list(normalized_values.keys()), list(normalized_values.values()), 
+                       color=['#7f7fff', '#7fbf7f', '#bf7fbf'], alpha=0.7)
+        ax4.set_xlabel('Normalized Value', fontsize=11)
+        ax4.set_title('Normalized Metrics Comparison', fontsize=12, fontweight='bold')
+        ax4.set_xlim(0, 1.1)
+        ax4.grid(axis='x', alpha=0.3)
+        # 添加原始值标签
+        for i, (key, val) in enumerate(normalized_values.items()):
+            if key == 'Inter/Intra\nRatio':
+                orig_val = sep["inter"] / max_intra if max_intra > 0 else 0
+                ax4.text(val, i, f'{orig_val:.3f}', ha='left', va='center', fontsize=9)
+            elif key == 'Fisher Ratio':
+                ax4.text(val, i, f'{fisher_val:.3f}', ha='left', va='center', fontsize=9)
+            else:
+                ax4.text(val, i, f'{bhatt_val:.3f}', ha='left', va='center', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(sep_vis_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        LOGGER.info(f"[{split}] Class separation visualization saved to {sep_vis_path}")
+    except Exception as e:
+        LOGGER.warning(f"Failed to save class separation visualization: {e}")
 
 def save_embeddings_for_projector(writer, emb, labels, epoch, projector_dir, split="val", tag="embedding", max_samples=50000):
     """
@@ -1460,7 +1633,7 @@ def save_embeddings_for_projector(writer, emb, labels, epoch, projector_dir, spl
     if N == 0:
         print(f"[Projector] Error: No valid embeddings to save for {split} (epoch {epoch})")
         return
-    
+
     emb_tensor = torch.tensor(emb, dtype=torch.float32)
     
     # 确保tensor和labels数量一致
@@ -1515,6 +1688,15 @@ def save_embeddings_for_projector(writer, emb, labels, epoch, projector_dir, spl
     print(f"[Projector] Saved: {N} {split} embeddings for epoch {epoch} (tensor shape: {emb_tensor.shape})")
     
 def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]:
+    # 创建带版本号的输出目录
+    base_output_dir = config.output_dir
+    version = 1
+    while (base_output_dir / f"v{version}").exists():
+        version += 1
+    config.output_dir = base_output_dir / f"v{version}"
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(f"Output directory: {config.output_dir} (version {version})")
+    
     _setup_logging(config.output_dir, verbose=verbose)
     config_dict = config.to_dict()
     train_config_serialized = copy.deepcopy(config_dict)
@@ -1549,8 +1731,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             tb_cmd = [
                 "tensorboard",
                 "--logdir", str(tb_dir),
-                # "--port", str(tb_port),
-                #"--host", "0.0.0.0",  # 允许外部访问
+                "--port", str(tb_port),
+                "--host", "0.0.0.0",  # 允许外部访问
             ]
             tb_process = subprocess.Popen(
                 tb_cmd,
@@ -1638,9 +1820,42 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         head_variant=config.head_variant,
         token_mixer_grid=config.token_mixer_grid,
         token_mixer_layers=config.token_mixer_layers,
-        use_arcface=config.use_arcface,
+        margin_method=config.margin_method,
     )
     model = OCEC(model_config).to(device)
+    
+    # 加载预训练权重（如果指定）
+    if config.pretrain_from:
+        pretrain_path = config.pretrain_from
+        if not pretrain_path.exists():
+            raise FileNotFoundError(f"Pretrain checkpoint not found: {pretrain_path}")
+        LOGGER.info(f"Loading pretrained weights from: {pretrain_path}")
+        pretrain_payload = torch.load(pretrain_path, map_location=device)
+        
+        # 只加载模型权重，不恢复训练状态
+        pretrain_model_state = pretrain_payload.get("model_state") or pretrain_payload.get("model")
+        if pretrain_model_state is None:
+            raise ValueError(f"No model state found in pretrain checkpoint: {pretrain_path}")
+        
+        # 处理 DataParallel 格式的权重（移除 'module.' 前缀）
+        if any(k.startswith("module.") for k in pretrain_model_state.keys()):
+            pretrain_model_state = {k.replace("module.", ""): v for k, v in pretrain_model_state.items() if k.startswith("module.")}
+        
+        # 尝试加载权重，允许部分匹配（忽略不匹配的层）
+        model_dict = model.state_dict()
+        pretrain_dict = {k: v for k, v in pretrain_model_state.items() if k in model_dict and model_dict[k].shape == v.shape}
+        missing_keys = set(model_dict.keys()) - set(pretrain_dict.keys())
+        unexpected_keys = set(pretrain_dict.keys()) - set(model_dict.keys())
+        
+        if missing_keys:
+            LOGGER.warning(f"Missing keys in pretrain checkpoint: {missing_keys}")
+        if unexpected_keys:
+            LOGGER.warning(f"Unexpected keys in pretrain checkpoint: {unexpected_keys}")
+        
+        model_dict.update(pretrain_dict)
+        model.load_state_dict(model_dict, strict=False)
+        LOGGER.info(f"Loaded {len(pretrain_dict)}/{len(model_dict)} layers from pretrain checkpoint")
+    
     ema = EMA(model, decay=0.999)
     
     # Multi-GPU support using DataParallel
@@ -1667,7 +1882,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
 
     pos_weight = _compute_pos_weight(splits["train"]).to(device)
 
-    if config.use_arcface:
+    if config.margin_method in ["arcface", "cosface"]:
         criterion = torch.nn.CrossEntropyLoss()
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1753,15 +1968,31 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             optimizer.load_state_dict(resume_payload["optimizer_state"])
         if resume_payload.get("scheduler_state"):
             # 恢复调度器状态
-            if scheduler["type"] == "warmup":
-                # 如果恢复时还在warmup阶段，恢复warmup调度器
-                if start_epoch <= scheduler["warmup_epochs"]:
-                    scheduler["warmup"].load_state_dict(resume_payload["scheduler_state"])
+            scheduler_state = resume_payload["scheduler_state"]
+            try:
+                # 检查scheduler_state的格式，判断是哪种调度器
+                # LambdaLR有'lr_lambdas'键，ReduceLROnPlateau没有
+                has_lr_lambdas = "lr_lambdas" in scheduler_state
+                
+                if scheduler["type"] == "warmup":
+                    # 如果恢复时还在warmup阶段，且scheduler_state是LambdaLR格式
+                    if start_epoch <= scheduler["warmup_epochs"] and has_lr_lambdas:
+                        scheduler["warmup"].load_state_dict(scheduler_state)
+                    else:
+                        # 如果已经过了warmup阶段，或者scheduler_state是ReduceLROnPlateau格式
+                        # 尝试加载到主调度器
+                        try:
+                            scheduler["main"].load_state_dict(scheduler_state)
+                        except Exception as e:
+                            LOGGER.warning(f"Failed to load scheduler state to main scheduler: {e}. Skipping scheduler state restoration.")
                 else:
-                    # 如果已经过了warmup阶段，恢复主调度器
-                    scheduler["main"].load_state_dict(resume_payload["scheduler_state"])
-            else:
-                scheduler["main"].load_state_dict(resume_payload["scheduler_state"])
+                    # 没有warmup，直接加载到主调度器
+                    try:
+                        scheduler["main"].load_state_dict(scheduler_state)
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to load scheduler state: {e}. Skipping scheduler state restoration.")
+            except Exception as e:
+                LOGGER.warning(f"Failed to restore scheduler state: {e}. Continuing without scheduler state restoration.")
         if resume_payload.get("scaler_state") and amp_enabled:
             scaler.load_state_dict(resume_payload["scaler_state"])
 
@@ -1844,7 +2075,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             autocast_enabled=amp_enabled,
             progress_desc=f"Train {epoch}/{config.epochs}",
             collect_outputs=True,
-            use_arcface=config.use_arcface,
+            margin_method=config.margin_method,
+            ema=ema,  # 训练阶段更新 EMA
         )
         # 只在特定epoch保存训练集embedding（每50个epoch或第一个epoch）
         if (epoch == 1 or epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
@@ -1860,7 +2092,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             LOGGER.info("Training embeddings saved.")
         if val_loader:
             LOGGER.info("Starting validation...")
+            # 应用 EMA 权重进行验证
             ema.apply(model)
+            # 确保模型处于 eval 模式（虽然 _run_epoch 会设置，但这里明确设置更安全）
+            model.eval()
             val_metrics, val_outputs = _run_epoch(
                 model,
                 val_loader,
@@ -1871,7 +2106,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 autocast_enabled=amp_enabled,
                 progress_desc=f"Val   {epoch}/{config.epochs}",
                 collect_outputs=True,
-                use_arcface=config.use_arcface,
+                margin_method=config.margin_method,
+                ema=None,  # 验证阶段不再更新 EMA，只使用 apply() 后的权重
             )
             
             if epoch % 50 == 0:
@@ -1930,7 +2166,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                         split="val"
                     )
     
+            # 验证后恢复原始模型权重（继续训练时使用原始权重，不是 EMA 权重）
             ema.restore(model)
+            # 恢复训练模式
+            model.train()
         else:
             val_metrics, val_outputs = None, None
         if epoch % 10 == 0:
@@ -2073,7 +2312,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             scaler=None,
             autocast_enabled=amp_enabled,
             progress_desc="Test",
-            use_arcface=config.use_arcface,
+            margin_method=config.margin_method,
         )
     LOGGER.info("Test metrics: %s", json.dumps(test_metrics, indent=2) if test_metrics else "n/a")
     if test_metrics:
@@ -2553,16 +2792,16 @@ def export_to_onnx(
             self.base_model = base_model
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # 导出时禁用 arcface，使用原始 head 输出
-            # 临时保存原始 use_arcface 状态
-            original_use_arcface = self.base_model.use_arcface
-            self.base_model.use_arcface = False
+            # 导出时禁用 margin-based loss，使用原始 head 输出
+            # 临时保存原始 margin_method 状态
+            original_margin_method = self.base_model.config.margin_method
+            self.base_model.config.margin_method = "none"
             
-            # 调用模型，不使用 arcface
+            # 调用模型，不使用 margin-based loss
             logits = self.base_model(x, labels=None, return_embedding=False)
             
             # 恢复原始状态
-            self.base_model.use_arcface = original_use_arcface
+            self.base_model.config.margin_method = original_margin_method
             
             # 处理不同形状的 logits
             if logits.ndim == 2 and logits.shape[1] == 2:
@@ -2661,12 +2900,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of transformer or MLP-mixer layers when using those head variants.",
     )
     train_parser.add_argument("--device", type=str, default="auto")
-    train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file.")
+    train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file (restores full training state).")
+    train_parser.add_argument("--pretrain", type=Path, help="Load pretrained weights from a checkpoint file (only loads model weights, does not restore training state).")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
     train_parser.add_argument(
-        "--use_arcface",
-        action="store_true",
-        help="Use ArcFace loss instead of BCE loss for training.",
+        "--margin_method",
+        type=str,
+        default="cosface",
+        choices=["none", "arcface", "cosface"],
+        help="Margin-based loss method: 'none' (BCE), 'arcface' (ArcFace), 'cosface' (CosFace/AM-Softmax). Default: cosface",
     )
     train_parser.add_argument(
         "--warmup_epochs",
@@ -2768,9 +3010,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             token_mixer_layers=args.token_mixer_layers,
             device=args.device,
             resume_from=args.resume,
+            pretrain_from=args.pretrain,
             use_amp=args.use_amp,
             warmup_epochs=args.warmup_epochs,
-            use_arcface=args.use_arcface,
+            margin_method=args.margin_method,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

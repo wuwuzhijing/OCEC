@@ -85,11 +85,8 @@ def find_csv_files(paths: List[Path]) -> List[Path]:
             else:
                 raise ValueError(f"Not a CSV file: {path}")
         elif path.is_dir():
-            # Find all annotation_*.csv files in directory
-            found = sorted(path.glob('annotation_*.csv'))
-            if not found:
-                # Fallback: look for any CSV files
-                found = sorted(path.glob('*.csv'))
+            # Find all CSV files in directory (any prefix)
+            found = sorted(path.glob('*.csv'))
             if not found:
                 raise ValueError(f"No CSV files found in directory: {path}")
             csv_files.extend(found)
@@ -114,12 +111,73 @@ def load_annotations(annotation_paths: List[Path]) -> pd.DataFrame:
     for csv_file in csv_files:
         if not csv_file.exists():
             raise FileNotFoundError(f"Annotation file not found: {csv_file}")
-        df = pd.read_csv(
-            csv_file,
-            header=None,
-            names=("image_path", "class_id"),
-            dtype={"image_path": str, "class_id": int},
-        )
+        
+        # Try to detect if CSV has header
+        # Read first line to check if it's a header
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            first_values = [v.strip() for v in first_line.split(',')]
+        
+        # Check if first line looks like a header
+        # Headers typically contain keywords like "File", "Path", "Label", "Class"
+        # and don't look like file paths (don't contain "/" or start with absolute paths)
+        has_header = False
+        if len(first_values) == 2:
+            col0_lower = first_values[0].lower()
+            col1_lower = first_values[1].lower()
+            header_keywords = ['file', 'path', 'image', 'label', 'class', 'id']
+            # Check if first line contains header keywords and doesn't look like a file path
+            is_likely_header = (
+                any(kw in col0_lower for kw in header_keywords) or 
+                any(kw in col1_lower for kw in header_keywords)
+            ) and not ('/' in first_values[0] or '\\' in first_values[0])
+            
+            if is_likely_header:
+                has_header = True
+        
+        # Read the full CSV file
+        if has_header:
+            # CSV has header, use it and map columns
+            df = pd.read_csv(csv_file, header=0)
+            
+            # Map column names to standard names
+            # Handle various possible column name formats
+            # First column should be image path, second should be class_id
+            if len(df.columns) != 2:
+                raise ValueError(
+                    f"Expected 2 columns in {csv_file}, got {len(df.columns)}: {list(df.columns)}"
+                )
+            
+            col_mapping = {}
+            # Map first column to image_path (if it contains path/image/file keywords)
+            col0_lower = str(df.columns[0]).lower()
+            col1_lower = str(df.columns[1]).lower()
+            
+            # Determine which column is image_path and which is class_id
+            if any(kw in col0_lower for kw in ['file', 'path', 'image']):
+                col_mapping[df.columns[0]] = "image_path"
+                col_mapping[df.columns[1]] = "class_id"
+            elif any(kw in col1_lower for kw in ['file', 'path', 'image']):
+                col_mapping[df.columns[1]] = "image_path"
+                col_mapping[df.columns[0]] = "class_id"
+            else:
+                # Default: first column is image_path, second is class_id
+                col_mapping[df.columns[0]] = "image_path"
+                col_mapping[df.columns[1]] = "class_id"
+            
+            df = df.rename(columns=col_mapping)
+            # Ensure correct data types
+            df["image_path"] = df["image_path"].astype(str)
+            df["class_id"] = df["class_id"].astype(int)
+        else:
+            # CSV has no header, read as data
+            df = pd.read_csv(
+                csv_file,
+                header=None,
+                names=("image_path", "class_id"),
+                dtype={"image_path": str, "class_id": int},
+            )
+        
         if not df.empty:
             dfs.append(df)
     
