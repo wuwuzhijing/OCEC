@@ -32,6 +32,15 @@ import os
 import subprocess
 import atexit
 
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+except ImportError:
+    raise ImportError(
+        "albumentations is required for data augmentation. "
+        "Install it with: pip install albumentations"
+    )
+
 CONF_THRESHOLD = 0.5
 
 def plot_dual_pca(emb_raw, emb_arc, labels, save_path):
@@ -401,7 +410,21 @@ def ks_distance(probs, labels):
 
 
 def hellinger_distance(hist0, hist1):
-    return float(np.sqrt(1 - np.sum(np.sqrt(hist0 * hist1))))
+    # 确保直方图值非负，避免 sqrt 计算错误
+    hist0 = np.clip(hist0, 0, None)
+    hist1 = np.clip(hist1, 0, None)
+    # 归一化直方图
+    sum0 = np.sum(hist0)
+    sum1 = np.sum(hist1)
+    if sum0 > 0:
+        hist0 = hist0 / sum0
+    if sum1 > 0:
+        hist1 = hist1 / sum1
+    # 计算 Hellinger 距离
+    sqrt_product = np.sqrt(hist0 * hist1)
+    bc = np.sum(sqrt_product)  # Bhattacharyya coefficient
+    bc = np.clip(bc, 0, 1)  # 确保在 [0, 1] 范围内
+    return float(np.sqrt(1 - bc))
 
 
 def kl_divergence(p, q):
@@ -905,18 +928,42 @@ def _set_seed(seed: int) -> None:
 def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[float]):
     height, width = _ensure_image_size_tuple(image_size)
     print("mean = {}, std = {}", mean, std)
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((height, width)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            # transforms.RandomRotation(degrees=(-20, 20)),
-            transforms_v2.RandomPhotometricDistort(p=0.5),
-            RandomCLAHE(p=0.01, tile_grid_size=(4, 4)),
-            # transforms.RandomGrayscale(p=0.01),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
-    )
+    train_transform = A.Compose([
+        A.Resize(height, width),
+
+        # ROI 偏移
+        A.ShiftScaleRotate(
+            shift_limit=0.05, scale_limit=0.05, rotate_limit=5,
+            border_mode=0, p=0.5
+        ),
+
+        # 模糊增强（视频环境核心）
+        A.MotionBlur(blur_limit=7, p=0.3),
+        A.GaussianBlur(blur_limit=3, p=0.2),
+        A.Defocus(p=0.2),
+
+        # 光照增强
+        A.RandomBrightnessContrast(
+            brightness_limit=0.2, contrast_limit=0.2, p=0.5
+        ),
+        A.ImageCompression(quality_lower=40, quality_upper=70, p=0.3),
+
+        # 噪声增强（IR 视频常见）
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+
+        # 遮挡增强
+        A.CoarseDropout(max_holes=1, max_height=8, max_width=8, p=0.1),
+
+        # Normalize: albumentations Normalize expects [0, 255] input by default (max_pixel_value=255.0)
+        # Formula: normalized = (image / 255.0 - mean) / std
+        # Since our mean/std are for [0, 1] range, this is correct:
+        # - Input: [0, 255] numpy array
+        # - Step 1: image / 255.0 -> [0, 1] range
+        # - Step 2: (image / 255.0 - mean) / std -> standardized [0, 1] range
+        # Then ToTensorV2() converts to tensor (values are already in [0, 1] range after normalization)
+        A.Normalize(mean=mean, std=std, max_pixel_value=255.0),
+        ToTensorV2(),
+    ])
     eval_transform = transforms.Compose(
         [
             transforms.Resize((height, width)),

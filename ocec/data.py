@@ -18,8 +18,12 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 # DEFAULT_MEAN = [0.0, 0.0, 0.0]
 # DEFAULT_STD = [1.0, 1.0, 1.0]
 
-DEFAULT_MEAN = [0.46961902, 0.46596417, 0.46912243]
-DEFAULT_STD  =  [0.17677383, 0.17855343, 0.17680589]
+
+# DEFAULT_MEAN = [0.46961902, 0.46596417, 0.46912243]
+# DEFAULT_STD  =  [0.17677383, 0.17855343, 0.17680589]
+
+DEFAULT_MEAN = [0.36043344, 0.28117363, 0.25993526]
+DEFAULT_STD  = [0.20355277, 0.18570374, 0.1877159]
 
 _SPLIT_ALIASES: Dict[str, str] = {
     "train": "train",
@@ -241,6 +245,34 @@ class OCECDataset(Dataset):
     def __init__(self, samples: Sequence[Sample], transform=None) -> None:
         self.samples = list(samples)
         self.transform = transform
+        # Pre-detect if transform is from albumentations
+        self._is_albumentations = False
+        if transform is not None:
+            # Method 1: Try to import and check isinstance
+            try:
+                import albumentations
+                if isinstance(transform, albumentations.core.composition.Compose):
+                    self._is_albumentations = True
+            except (ImportError, AttributeError):
+                pass
+            
+            # Method 2: Check module name
+            if not self._is_albumentations:
+                try:
+                    module_name = transform.__class__.__module__
+                    if 'albumentations' in module_name:
+                        self._is_albumentations = True
+                except (AttributeError, TypeError):
+                    pass
+            
+            # Method 3: Check type string
+            if not self._is_albumentations:
+                try:
+                    type_str = str(type(transform))
+                    if 'albumentations' in type_str.lower():
+                        self._is_albumentations = True
+                except (AttributeError, TypeError):
+                    pass
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -256,7 +288,15 @@ class OCECDataset(Dataset):
         sample = self.samples[index]
         image = self._load_image(sample)
         if self.transform is not None:
-            image = self.transform(image)
+            if self._is_albumentations:
+                # It's albumentations: convert PIL to numpy and use named args
+                import numpy as np
+                image_np = np.array(image)
+                result = self.transform(image=image_np)
+                image = result['image']
+            else:
+                # It's torchvision: use positional args with PIL Image
+                image = self.transform(image)
         label = torch.tensor(float(sample.label), dtype=torch.float32)
         return {
             "image": image,
