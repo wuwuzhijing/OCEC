@@ -10,9 +10,10 @@ import torch.nn.functional as F
 
 class ArcFaceHead(nn.Module):
     """ArcFace: Additive Angular Margin Loss"""
-    def __init__(self, embedding_dim, num_classes=2, s=30.0, m=0.50):
+    def __init__(self, embedding_dim, num_classes=2, s=30.0, s_val = 10.0, m=0.50):
         super().__init__()
         self.s = s
+        self.s_val = s_val
         self.m = m
         self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
         nn.init.xavier_uniform_(self.weight)
@@ -24,7 +25,7 @@ class ArcFaceHead(nn.Module):
 
         if labels is None:
             # 验证/推理时：返回不带 scale 的 logits，避免概率分布过于极端
-            return logits  # 不使用 scale，让 softmax 产生更合理的概率分布
+            return logits * self.s_val # 不使用 scale，让 softmax 产生更合理的概率分布
 
         # 训练时：ArcFace: cos(θ + m)，然后乘以 scale
         theta = torch.acos(torch.clamp(logits, -1 + 1e-7, 1 - 1e-7))
@@ -37,22 +38,23 @@ class ArcFaceHead(nn.Module):
 
 class CosFaceHead(nn.Module):
     """CosFace (AM-Softmax): Additive Margin Softmax Loss"""
-    def __init__(self, embedding_dim, num_classes=2, s=30.0, m=0.35):
+    def __init__(self, embedding_dim, num_classes=2, s=30.0, s_val = 10.0, m=0.35):
         super().__init__()
         self.s = s
+        self.s_val = s_val
         self.m = m
         self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, embedding, labels=None):
-        emb = F.normalize(embedding, dim=1)
-        w = F.normalize(self.weight, dim=1)
-        logits = F.linear(emb, w)   # (B, 2)
+        emb = F.normalize(embedding, dim=1) # 将embedding映射到超球面，保留方向结构信息，不仅仅有模长信息
+        w = F.normalize(self.weight, dim=1) # 两个分类方向归一化为单位向量
+        logits = F.linear(emb, w)   # 余弦相似度
 
         if labels is None:
             # 验证/推理时：返回不带 scale 的 logits，避免概率分布过于极端
             # 或者使用较小的 scale 来软化分布
-            return logits  # 不使用 scale，让 softmax 产生更合理的概率分布
+            return logits * self.s_val  # scale减小，让 softmax 产生更合理的概率分布
 
         # 训练时：CosFace: cos(θ) - m，然后乘以 scale
         one_hot = F.one_hot(labels.long(), num_classes=2)
@@ -458,10 +460,19 @@ class OCEC(nn.Module):
             emb_dim = self._feature_channels   # transformer/mixer head 的 embedding dim
             if self.config.margin_method == "arcface":
                 # ArcFace: m=0.2 (角度间隔), s=8 (scale)
-                self.margin_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.2, s=8)
+                self.margin_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.2, s=8, s_val=4)
             elif self.config.margin_method == "cosface":
                 # CosFace: m=0.35 (余弦间隔), s=8 (scale)
-                self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.35, s=8)
+                # | 任务类型          | 推荐 margin       | 说明                  |
+                #| ------------- | --------------- | ------------------- |
+                #| 二分类（眼睛/气泡/声纹） | **0.20 ~ 0.35** | 太大容易造成训练“拒绝模糊样本”    |
+                #| 多分类 (>20类)    | 0.35 ~ 0.50     | 因为类间关系多，需要更强 margin |
+                # | embedding_dim | 推荐 s      |
+                #| ------------- | --------- |
+                #| 64–128        | **16–32** |
+                #| 32–64         | **8–20**  |
+                # 推理 scale 一般占训练 scale 的 30–50%
+                self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.25, s=24, s_val=10)
         else:
             self.margin_head = None
 
@@ -506,29 +517,21 @@ class OCEC(nn.Module):
             logits = logits.squeeze(1)
 
         if self.margin_head is not None:
-            # Margin-based loss (ArcFace/CosFace): 训练时使用 labels 和 margin，验证/推理时不使用 margin
+            # Margin-based loss (CosFace): 训练时使用 labels 和 margin，验证/推理时不使用 margin
             # 通过 self.training 判断是否在训练模式
             # 验证/推理时即使有 labels 也不使用 margin，确保行为一致
-            use_margin = (training is not None and training) or (training is None and self.training)
+            # use_margin = (training is not None and training) or (training is None and self.training)
             
-            if use_margin:
-                # 训练时：使用 margin_head 的 logits（带 margin）
-                margin_labels = labels
-                if return_embedding:
-                    logits_margin = self.margin_head(embedding, margin_labels)
-                    return logits_margin, embedding
-                else:
-                    logits_margin = self.margin_head(embedding, margin_labels)
-                    return logits_margin
+            # 训练时：使用 margin_head 的 logits（带 margin）
+            margin_labels = labels
+            if return_embedding:
+                logits_margin = self.margin_head(embedding, margin_labels)
+                return logits_margin, embedding
             else:
-                # 验证/推理时：使用原始 head 的 logits，而不是 margin_head
-                # 因为 margin_head 的权重可能偏向训练时的类别分布，导致验证时预测偏差
-                # 使用原始 logits 可以更准确地反映模型的真实性能
-                if return_embedding:
-                    return logits, embedding
-                return logits
+                logits_margin = self.margin_head(embedding, margin_labels)
+                return logits_margin
 
-        # 原逻辑（不使用 margin）
+        # 不使用 margin
         if return_embedding:
             return logits, embedding
         return logits

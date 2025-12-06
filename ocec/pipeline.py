@@ -1323,6 +1323,7 @@ def _run_epoch(
                             # 使用 softmax 计算概率
                             probs = torch.softmax(logits_no_margin_scaled, dim=1)[:, 1]
                             logits_for_debug = logits_no_margin_scaled
+                            confidence = probs.cpu()
                         else:
                             # 如果没有 margin_head（不应该发生），回退到原始 logits
                             LOGGER.warning("Training: margin_method is set but margin_head is None, using original logits")
@@ -1374,7 +1375,7 @@ def _run_epoch(
                 
                 probs = torch.sigmoid(logits_bce)
                 logits_for_debug = logits
-
+        
         if train_mode:
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1478,12 +1479,6 @@ def _run_epoch(
     label_pos_ratio = total_pos_labels / stats["samples"] if stats["samples"] > 0 else 0.0
     pred_pos_ratio = total_pos_preds / stats["samples"] if stats["samples"] > 0 else 0.0
     
-
-    if slice_enabled:
-        hard_ratio = (confidence < config.slice_medium_threshold).float().mean().item()
-        train_metrics["hard_ratio"] = hard_ratio
-        writer.add_scalar("slice/hard_ratio", hard_ratio, epoch)
-
     # 计算概率统计（如果收集了输出）
     prob_stats = ""
     if collect_outputs and collected_probs:
@@ -1509,7 +1504,9 @@ def _run_epoch(
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "hard_radio": 0.1
     }
+
     extras = None
     if collect_outputs:
         all_probs = torch.cat(collected_probs).squeeze().numpy() if collected_probs else np.array([], dtype=float)
@@ -2408,6 +2405,66 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             margin_method=config.margin_method,
             ema=ema,  # 训练阶段更新 EMA
         )
+
+        # ---- Hard sample stats (only if slice enabled & outputs available) ----
+        if config.enable_slice_training and train_outputs is not None:
+            logits = train_outputs["logits"]  # [N]
+            labels = train_outputs["labels"]  # [N]
+
+            probs = torch.sigmoid(logits.detach().cpu())
+            confidence = torch.abs(probs - 0.5) * 2  # 0=最难，1=最容易
+
+            hard_mask = confidence < config.slice_medium_threshold
+            hard_ratio = hard_mask.float().mean().item()
+
+            train_metrics["hard_ratio"] = hard_ratio
+
+            tb_writer.add_scalar("slice/hard_ratio", hard_ratio, epoch)
+
+            LOGGER.info(f"[SliceStats] Epoch {epoch}: hard_ratio={hard_ratio:.4f}")
+
+        # ---- Embedding Margin Heatmap (only if enabled) ----
+        if getattr(config, "enable_margin_heatmap", False) and train_outputs is not None:
+            embeddings = train_outputs["embeddings"].detach().cpu()  # [N, D]
+            labels = train_outputs["labels"].detach().cpu()           # [N]
+            
+            # 计算类中心（prototype）
+            class_centers = []
+            for cls in [0, 1]:
+                cls_emb = embeddings[labels == cls]
+                class_centers.append(cls_emb.mean(dim=0, keepdim=True))  # [1,D]
+
+            c0, c1 = class_centers
+            # 每个样本与两个类别中心的余弦距离差（margin 越高分界越清晰）
+            sim0 = torch.nn.functional.cosine_similarity(embeddings, c0)
+            sim1 = torch.nn.functional.cosine_similarity(embeddings, c1)
+            margins = (sim1 - sim0).numpy()  # 正数倾向类1，负数倾向类0
+
+            # 生成可视化热力图
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            fig = plt.figure(figsize=(8, 4))
+            sns.kdeplot(margins[labels == 0], fill=True, label="class 0")
+            sns.kdeplot(margins[labels == 1], fill=True, label="class 1")
+            plt.axvline(0, color="black", linestyle="--", label="decision boundary")
+            plt.title(f"Embedding Margin Distribution (epoch {epoch})")
+            plt.legend()
+
+            # 保存图像
+            margin_dir = config.output_dir / "margin_heatmap"
+            margin_dir.mkdir(exist_ok=True)
+            fig_path = margin_dir / f"epoch_{epoch:03d}.png"
+            plt.savefig(fig_path, dpi=150)
+            plt.close(fig)
+
+            # 写入 TensorBoard
+            tb_writer.add_image(
+                "embedding/margin_heatmap", 
+                plt.imread(str(fig_path)), 
+                epoch, 
+                dataformats="HWC"
+            )
+            LOGGER.info(f"[Viz] Saved margin heatmap for epoch {epoch} → {fig_path}")
 
         # ==========================================
         # 🔥 Slice Training Trigger
