@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import os
 import subprocess
 import atexit
+from sklearn.metrics import precision_recall_fscore_support
 
 try:
     import albumentations as A
@@ -42,6 +43,62 @@ except ImportError:
     )
 
 CONF_THRESHOLD = 0.5
+
+def plot_threshold_curve(results, save_path):
+    thresholds = [r[0] for r in results]
+    precision = [r[1] for r in results]
+    recall = [r[2] for r in results]
+    f1 = [r[3] for r in results]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds, precision, label="Precision")
+    plt.plot(thresholds, recall, label="Recall")
+    plt.plot(thresholds, f1, label="F1-score", linewidth=3)
+    plt.xlabel("Threshold")
+    plt.ylabel("Score")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Threshold Sweep Curve")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+def sweep_thresholds(probs, labels, num_steps=200):
+    """
+    Sweep decision thresholds and compute metrics to find the optimal point.
+
+    Args:
+        probs: model predicted probability of positive class (numpy array)
+        labels: ground truth labels (numpy array)
+        num_steps: number of thresholds to evaluate
+
+    Returns:
+        dict with best threshold and full sweep stats
+    """
+
+    thresholds = np.linspace(0, 1, num_steps)
+    results = []
+
+    best_f1, best_threshold = 0.0, 0.5
+
+    for t in thresholds:
+        preds = (probs >= t).astype(np.int32)
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, preds, average="binary", zero_division=0
+        )
+
+        results.append((t, precision, recall, f1))
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = t
+
+    return {
+        "best_threshold": best_threshold,
+        "best_f1": best_f1,
+        "curve": results,
+    }
 
 def plot_dual_pca(emb_raw, emb_arc, labels, save_path):
     try:
@@ -1250,6 +1307,7 @@ def _run_epoch(
             if ema is not None:
                 ema.update(model)
 
+             
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
         stats["samples"] += batch_size
@@ -2295,7 +2353,13 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 margin_method=config.margin_method,
                 ema=None,  # 验证阶段不再更新 EMA，只使用 apply() 后的权重
             )
-            
+            if (epoch > 10 and epoch < 50 and epoch % 5 == 0) or (epoch > 50 and epoch % 10 == 0) or (epoch == config.epochs):
+                sweep_result = sweep_thresholds(val_outputs["probs"], val_outputs["labels"])
+                best_thr = sweep_result["best_threshold"]
+                best_f1 = sweep_result["best_f1"]
+                LOGGER.info(f"🔍 Best threshold sweep result -> threshold={best_thr:.4f}, f1={best_f1:.4f}")
+                plot_threshold_curve(sweep_result["curve"], f"{output_dir}/threshold_sweep_epoch{epoch:04d}.png")
+
             if epoch % 50 == 0:
                 if val_outputs is not None and val_outputs["embeddings"] is not None:
                     # ========= 错误样本蒙太奇 =========
