@@ -15,15 +15,13 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-# DEFAULT_MEAN = [0.0, 0.0, 0.0]
-# DEFAULT_STD = [1.0, 1.0, 1.0]
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x # 如果没安装，则不显示进度条
 
-
-# DEFAULT_MEAN = [0.46961902, 0.46596417, 0.46912243]
-# DEFAULT_STD  =  [0.17677383, 0.17855343, 0.17680589]
-
-DEFAULT_MEAN = [0.36043344, 0.28117363, 0.25993526]
-DEFAULT_STD  = [0.20355277, 0.18570374, 0.1877159]
+DEFAULT_MEAN = [0.42740763060926645, 0.39452373400411184, 0.38825020228993445]
+DEFAULT_STD  = [0.194970523692498, 0.20245007710754218, 0.20778578022977737]
 
 _SPLIT_ALIASES: Dict[str, str] = {
     "train": "train",
@@ -245,6 +243,22 @@ class OCECDataset(Dataset):
     def __init__(self, samples: Sequence[Sample], transform=None) -> None:
         self.samples = list(samples)
         self.transform = transform
+
+        logging.info(f"Pre-loading {len(samples)} image data into RAM...")
+        self._image_cache = []
+        # 遍历所有样本，执行耗时的解码操作
+        for sample in tqdm(self.samples, desc="Loading images to RAM"):
+            # 仅在初始化时执行一次昂贵的解码操作
+            # Image.open(io.BytesIO(...)) 和 .convert("RGB") 是耗时操作
+            try:
+                image = Image.open(io.BytesIO(sample.image_bytes)).convert("RGB")
+                self._image_cache.append(image)
+            except Exception as e:
+                logging.warning(f"Failed to load image at index {sample.index}. Error: {e}")
+                # 遇到错误时，存储一个 None 或一个占位符，避免崩溃
+                self._image_cache.append(None) 
+                
+        logging.info(f"Finished loading {len(self._image_cache)} images to RAM.")            
         # Pre-detect if transform is from albumentations
         self._is_albumentations = False
         if transform is not None:
@@ -286,7 +300,11 @@ class OCECDataset(Dataset):
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
-        image = self._load_image(sample)
+        # image = self._load_image(sample)
+        image = self._image_cache[index]
+        if image is None:
+            # 如果缓存中是 None，说明加载失败了，跳过或报错
+            raise RuntimeError(f"Image at index {index} was not loaded correctly during initialization.")
         if self.transform is not None:
             if self._is_albumentations:
                 # It's albumentations: convert PIL to numpy and use named args

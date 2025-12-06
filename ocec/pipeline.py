@@ -786,6 +786,9 @@ class TrainConfig:
     pretrain_from: Optional[Path] = None  # 预训练权重路径（只加载模型权重，不恢复训练状态）
     use_amp: bool = False
     warmup_epochs: int = 5  # Warmup阶段的epoch数，0表示不使用warmup
+    freeze_backbone: bool = False  # 是否冻结backbone（只训练head）
+    unfreeze_backbone_epoch: Optional[int] = None  # 在指定epoch解冻backbone（用于渐进式微调）
+    stage2_lr: Optional[float] = None  # 第二阶段学习率（如果为None，则使用lr * 0.05）
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -925,53 +928,142 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+class RandomNoiseWrapper(torch.nn.Module):
+    def __init__(self, min_std=0.01, max_std=0.03, p=0.1):
+        super().__init__()
+        self.min_std, self.max_std, self.p = min_std, max_std, p
+
+    def forward(self, x):
+        if torch.rand(1) > self.p:
+            return x
+        std = torch.empty(1).uniform_(self.min_std, self.max_std).item()
+        return x + torch.randn_like(x) * std
+
 def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[float]):
+    """Hybrid CPU + GPU transform: IR-friendly"""
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
     height, width = _ensure_image_size_tuple(image_size)
-    print("mean = {}, std = {}", mean, std)
-    train_transform = A.Compose([
+
+    # CPU 部分（轻量 deterministic）：只负责 resize + normalize
+    base_transform = A.Compose([
         A.Resize(height, width),
-
-        # ROI 偏移
-        A.ShiftScaleRotate(
-            shift_limit=0.05, scale_limit=0.05, rotate_limit=5,
-            border_mode=0, p=0.5
-        ),
-
-        # 模糊增强（视频环境核心）
-        A.MotionBlur(blur_limit=7, p=0.3),
-        A.GaussianBlur(blur_limit=3, p=0.2),
-        A.Defocus(p=0.2),
-
-        # 光照增强
-        A.RandomBrightnessContrast(
-            brightness_limit=0.2, contrast_limit=0.2, p=0.5
-        ),
-        A.ImageCompression(quality_lower=40, quality_upper=70, p=0.3),
-
-        # 噪声增强（IR 视频常见）
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
-
-        # 遮挡增强
-        A.CoarseDropout(max_holes=1, max_height=8, max_width=8, p=0.1),
-
-        # Normalize: albumentations Normalize expects [0, 255] input by default (max_pixel_value=255.0)
-        # Formula: normalized = (image / 255.0 - mean) / std
-        # Since our mean/std are for [0, 1] range, this is correct:
-        # - Input: [0, 255] numpy array
-        # - Step 1: image / 255.0 -> [0, 1] range
-        # - Step 2: (image / 255.0 - mean) / std -> standardized [0, 1] range
-        # Then ToTensorV2() converts to tensor (values are already in [0, 1] range after normalization)
         A.Normalize(mean=mean, std=std, max_pixel_value=255.0),
-        ToTensorV2(),
+        ToTensorV2(),   # torch tensor 输出
     ])
-    eval_transform = transforms.Compose(
-        [
-            transforms.Resize((height, width)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
+
+    # GPU 部分（随机transform，用于训练）
+    import kornia.augmentation as K
+    # gpu_aug = torch.nn.Sequential(
+    #     K.RandomAffine(
+    #         degrees=3, translate=(0.02, 0.02), scale=(0.97, 1.03),
+    #         p=0.30, padding_mode="zeros"
+    #     ),
+    #     K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.0), p=0.10),
+    #     K.RandomGaussianNoise(std=(0.01, 0.03), p=0.10),
+    #     K.RandomBrightness(0.25, p=0.35),
+    #     K.RandomContrast(0.25, p=0.35),
+
+    #     # ↓↓↓ Older Kornia API
+    #     K.RandomJPEG(jpeg_quality=(50, 90), p=0.20)
+    # )
+
+    gpu_aug = torch.nn.Sequential(
+        K.RandomAffine(
+            degrees=3, translate=(0.02, 0.02), scale=(0.97, 1.03),
+            p=0.30, padding_mode="zeros"
+        ),
+
+        # GaussianBlur: tuple sigma sometimes works, but we lock range manually
+        K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.5, 1.2), p=0.10),
+
+        # ❗ GaussianNoise must use scalar std for Kornia 0.8.2
+        RandomNoiseWrapper(),
+
+        K.RandomBrightness(brightness=0.25, p=0.35),
+        K.RandomContrast(contrast=0.25, p=0.35),
+
+        # Kornia 0.8.2 JPEG API
+        K.RandomJPEG(jpeg_quality=(50, 90), p=0.20),
     )
-    return train_transform, eval_transform
+
+    # ⚠️ 绑定属性（外部 pipeline 不改）
+    base_transform.gpu_aug = gpu_aug
+    return base_transform, base_transform   # train / val 由调用处决定是否应用 gpu_aug
+
+
+def _freeze_backbone(model: nn.Module) -> None:
+    """冻结backbone（stem和features），只训练head和margin_head"""
+    # 处理DataParallel包装的模型
+    base_model = model.module if hasattr(model, 'module') else model
+    
+    frozen_count = 0
+    trainable_count = 0
+    
+    for name, param in base_model.named_parameters():
+        # 冻结stem和features（backbone）
+        if 'stem' in name or 'features' in name:
+            param.requires_grad = False
+            frozen_count += 1
+        else:
+            # head和margin_head保持可训练
+            param.requires_grad = True
+            trainable_count += 1
+    
+    LOGGER.info(f"Frozen {frozen_count} backbone parameters, {trainable_count} head parameters remain trainable")
+
+
+def _unfreeze_backbone_last_layers(model: nn.Module, num_layers: int = 2) -> None:
+    """
+    解冻backbone的最后N层（features的最后N个block）
+    num_layers: 解冻的层数（默认2层）
+    """
+    # 处理DataParallel包装的模型
+    base_model = model.module if hasattr(model, 'module') else model
+    
+    # 获取features模块（Sequential）
+    if not hasattr(base_model, 'features'):
+        LOGGER.warning("Model does not have 'features' attribute")
+        return
+    
+    features_module = base_model.features
+    if not isinstance(features_module, nn.Sequential):
+        LOGGER.warning("Features module is not Sequential, cannot unfreeze by layer")
+        return
+    
+    # 获取features中的block数量
+    num_blocks = len(features_module)
+    if num_layers > num_blocks:
+        LOGGER.warning(f"Requested {num_layers} layers but only {num_blocks} blocks available, unfreezing all blocks")
+        num_layers = num_blocks
+    
+    # 解冻最后N个block
+    unfrozen_count = 0
+    for i in range(num_blocks - num_layers, num_blocks):
+        block = features_module[i]
+        for param in block.parameters():
+            param.requires_grad = True
+            unfrozen_count += 1
+    
+    LOGGER.info(f"Unfroze last {num_layers} blocks of features ({unfrozen_count} parameters)")
+    
+    # 同时解冻stem（如果需要的话，通常stem参数较少，解冻影响不大）
+    # 这里我们只解冻features，stem保持冻结
+
+
+def _unfreeze_backbone_fully(model: nn.Module) -> None:
+    """完全解冻backbone"""
+    # 处理DataParallel包装的模型
+    base_model = model.module if hasattr(model, 'module') else model
+    
+    unfrozen_count = 0
+    for name, param in base_model.named_parameters():
+        if 'stem' in name or 'features' in name:
+            param.requires_grad = True
+            unfrozen_count += 1
+    
+    LOGGER.info(f"Fully unfroze {unfrozen_count} backbone parameters")
 
 
 def _compute_pos_weight(samples: Sequence) -> torch.Tensor:
@@ -1040,6 +1132,15 @@ def _run_epoch(
     for batch in iterator:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True).long()
+        # === Apply GPU augment only during training ===
+        if train_mode:
+            if images.dtype != torch.float32:
+                images = images.float()
+            if hasattr(dataloader.dataset.transform, "gpu_aug"):
+                gpu_aug = dataloader.dataset.transform.gpu_aug
+                if gpu_aug is not None:
+                    # Kornia expects (B,C,H,W) float and normalized input
+                    images = gpu_aug(images)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -1903,6 +2004,11 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         model.load_state_dict(model_dict, strict=False)
         LOGGER.info(f"Loaded {len(pretrain_dict)}/{len(model_dict)} layers from pretrain checkpoint")
     
+    # 冻结backbone（如果指定）
+    if config.freeze_backbone:
+        _freeze_backbone(model)
+        LOGGER.info("Backbone frozen: only head and margin_head will be trained")
+    
     ema = EMA(model, decay=0.999)
     
     # Multi-GPU support using DataParallel
@@ -2112,6 +2218,39 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             )
 
     for epoch in range(start_epoch, config.epochs + 1):
+        # 检查是否需要解冻backbone（渐进式微调）
+        if config.unfreeze_backbone_epoch is not None and epoch == config.unfreeze_backbone_epoch:
+            # 检查第一阶段效果（如果验证集F1达到目标，才解冻）
+            if val_metrics is not None and val_metrics.get("f1", 0) >= 0.80:
+                LOGGER.info(f"Epoch {epoch}: Stage 1 F1={val_metrics['f1']:.4f} >= 0.80, proceeding to Stage 2")
+                LOGGER.info(f"Epoch {epoch}: Unfreezing last 2 layers of backbone for progressive fine-tuning")
+                _unfreeze_backbone_last_layers(model, num_layers=2)
+                # 重新创建优化器，包含新解冻的参数，使用更小的学习率
+                if config.stage2_lr is not None:
+                    stage2_lr = config.stage2_lr
+                else:
+                    stage2_lr = config.lr * 0.05  # 默认使用原始学习率的5%
+                optimizer = torch.optim.AdamW(
+                    (param for param in model.parameters() if param.requires_grad),
+                    lr=stage2_lr,
+                    weight_decay=config.weight_decay,
+                )
+                LOGGER.info(f"Recreated optimizer with Stage 2 LR: {stage2_lr:.6f}")
+                # 重新创建学习率调度器
+                main_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="min", factor=0.5, patience=2
+                )
+                if warmup_epochs > 0:
+                    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+                    scheduler = {"type": "warmup", "warmup": warmup_scheduler, "main": main_scheduler, "warmup_epochs": warmup_epochs}
+                else:
+                    scheduler = {"type": "main", "main": main_scheduler, "warmup_epochs": 0}
+            else:
+                if val_metrics is not None:
+                    LOGGER.warning(f"Epoch {epoch}: Stage 1 F1={val_metrics['f1']:.4f} < 0.80, skipping Stage 2 unfreezing")
+                else:
+                    LOGGER.warning(f"Epoch {epoch}: No validation metrics available, skipping Stage 2 unfreezing")
+        
         train_metrics, train_outputs = _run_epoch(
             model,
             train_loader,
@@ -2949,6 +3088,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="auto")
     train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file (restores full training state).")
     train_parser.add_argument("--pretrain", type=Path, help="Load pretrained weights from a checkpoint file (only loads model weights, does not restore training state).")
+    train_parser.add_argument("--freeze_backbone", action="store_true", help="Freeze backbone layers, only train head and margin_head (for fine-tuning).")
+    train_parser.add_argument("--unfreeze_backbone_epoch", type=int, default=None, help="Epoch to unfreeze last 2 layers of backbone (for progressive fine-tuning).")
+    train_parser.add_argument("--stage2_lr", type=float, default=None, help="Learning rate for stage 2 (after unfreezing backbone). If not specified, uses lr * 0.05.")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
     train_parser.add_argument(
         "--margin_method",
@@ -3061,6 +3203,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             use_amp=args.use_amp,
             warmup_epochs=args.warmup_epochs,
             margin_method=args.margin_method,
+            freeze_backbone=args.freeze_backbone,
+            unfreeze_backbone_epoch=args.unfreeze_backbone_epoch,
+            stage2_lr=args.stage2_lr,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":
