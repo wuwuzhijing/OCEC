@@ -295,6 +295,21 @@ def detect_mislabeled(probs, labels, emb, threshold=0.15):
             wrong.append((i, int(labels[i]), pred, float(p)))
     return wrong
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, alpha=0.5, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        """logits: (B,2), targets: (B,)"""
+        ce_loss = F.cross_entropy(logits, targets, reduction="none")  # 不reduce
+        pt = torch.exp(-ce_loss)  # softmax 后的概率（来自 CE）
+        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss)
+
+        return focal_loss.mean() if self.reduction == "mean" else focal_loss.sum()
+            
 class FocalLabelSmoothCE(nn.Module):
     def __init__(self, smoothing=0.05, gamma=2.0):
         super().__init__()
@@ -1210,12 +1225,14 @@ def _run_epoch(
                 # 验证时，如果 logits 不是 [B, 2] 形状，说明使用的是原始 head，需要特殊处理
                 if train_mode:
                     # 训练时：使用 CrossEntropyLoss，logits 应该是 [B, 2] 形状
-                    loss = criterion(logits, labels.long())
+                    # loss = criterion(logits, labels.long())
+                    loss = focal_loss(logits, labels)
                 else:
                     # 验证时：根据 logits 形状选择合适的损失函数
                     if logits.ndim == 2 and logits.size(1) == 2:
                         # [B, 2] 形状：使用 CrossEntropyLoss
-                        loss = criterion(logits, labels.long())
+                        # loss = criterion(logits, labels.long())
+                        loss = focal_loss(logits, labels)
                     else:
                         # [B] 或 [B, 1] 形状：使用 BCEWithLogitsLoss
                         logits_bce = logits.squeeze(1) if logits.ndim == 2 and logits.size(1) == 1 else logits
@@ -1292,6 +1309,7 @@ def _run_epoch(
                 else:
                     logits_bce = logits
                 loss = criterion(logits_bce, labels.float())
+                
                 probs = torch.sigmoid(logits_bce)
                 logits_for_debug = logits
 
