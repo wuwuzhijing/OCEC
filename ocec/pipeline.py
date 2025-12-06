@@ -1181,9 +1181,9 @@ def _run_epoch(
                         
                         if margin_head is not None:
                             # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
-                            logits_no_margin = margin_head(embedding, labels=None)  # (B, 2)，范围 [-1, 1]
+                            logits_no_margin = margin_head(embedding, labels=None)#已经在模型中定义好了
                             # 应用 scale 以匹配训练时的 logits 范围
-                            logits_no_margin_scaled = logits_no_margin * margin_head.s  # (B, 2)，范围约 [-s, s]
+                            logits_no_margin_scaled = logits_no_margin
                             # 使用 softmax 计算概率
                             probs = torch.softmax(logits_no_margin_scaled, dim=1)[:, 1]
                             logits_for_debug = logits_no_margin_scaled
@@ -1213,7 +1213,7 @@ def _run_epoch(
                             # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
                             logits_margin = margin_head(embedding, labels=None)  # (B, 2)，范围 [-1, 1]
                             # 应用 scale 以匹配训练时的 logits 范围
-                            logits_margin_scaled = logits_margin * margin_head.s  # (B, 2)，范围约 [-s, s]
+                            logits_margin_scaled = logits_margin * margin_head.s_val  # (B, 2)，范围约 [-s, s]
                             # 使用 softmax 计算概率
                             probs = torch.softmax(logits_margin_scaled, dim=1)[:, 1]
                             logits_for_debug = logits_margin_scaled
