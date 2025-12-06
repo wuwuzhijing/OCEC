@@ -240,9 +240,16 @@ def split_samples(
 class OCECDataset(Dataset):
     """Torch dataset that reads eyes crops from disk or embedded bytes."""
 
-    def __init__(self, samples: Sequence[Sample], transform=None) -> None:
+    def __init__(self, samples: Sequence[Sample], transform=None, confidence_dict=None) -> None:
         self.samples = list(samples)
         self.transform = transform
+
+        # ---- Confidence support ----
+        self._has_confidence = confidence_dict is not None
+        if self._has_confidence:
+            self.confidence = [confidence_dict.get(s.path, 1.0) for s in samples]
+        else:
+            self.confidence = [1.0] * len(samples)
 
         logging.info(f"Pre-loading {len(samples)} image data into RAM...")
         self._image_cache = []
@@ -319,6 +326,7 @@ class OCECDataset(Dataset):
         return {
             "image": image,
             "label": label,
+            "confidence": torch.tensor(self.confidence[index], dtype=torch.float32),
             "video_name": sample.video_name,
             "path": sample.path,
             "base_frame": sample.base_frame,

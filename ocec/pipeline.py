@@ -861,6 +861,11 @@ class TrainConfig:
     freeze_backbone: bool = False  # 是否冻结backbone（只训练head）
     unfreeze_backbone_epoch: Optional[int] = None  # 在指定epoch解冻backbone（用于渐进式微调）
     stage2_lr: Optional[float] = None  # 第二阶段学习率（如果为None，则使用lr * 0.05）
+    enable_slice_training: bool = False
+    slice_easy_threshold: float = 0.85
+    slice_medium_threshold: float = 0.60
+    slice_stage_epochs: tuple = (85, 95)  # (easy_end, medium_end)
+    slice_hard_ratio: float = 0.20  # 10–20% hard samples
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1178,6 +1183,12 @@ def _run_epoch(
     collect_outputs: bool = False,
     margin_method: str = "cosface",  # "none", "arcface", "cosface"
     ema: Optional["EMA"] = None,     # 可选的 EMA 对象，用于在训练阶段更新滑动平均权重
+    epoch: int = 1,
+    enable_slice_training: bool = False,
+    slice_stage_epochs: tuple = (85, 95),
+    slice_easy_threshold: float = 0.85,
+    slice_medium_threshold: float = 0.60, 
+    slice_hard_ratio: float = 0.20
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
@@ -1201,9 +1212,60 @@ def _run_epoch(
     if progress_desc:
         iterator = tqdm(iterator, desc=progress_desc, leave=False, dynamic_ncols=True)
 
+    slice_enabled = enable_slice_training
+    easy_end, medium_end = slice_stage_epochs
+
     for batch in iterator:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True).long()
+
+        # ======================= Slice Training Logic ======================
+        confidence = batch.get("confidence", None)
+        if train_mode and slice_enabled and confidence is not None:
+            epoch_id = epoch
+
+            # Stage A: only easy samples
+            if epoch_id < easy_end:
+                mask = confidence >= slice_easy_threshold
+
+            # Stage B: include medium samples
+            elif epoch_id < medium_end:
+                mask = confidence >= slice_medium_threshold
+
+            # Stage C: include hard samples with ratio control
+            else:
+                hard_mask = confidence < slice_medium_threshold
+                easy_mask = confidence >= slice_medium_threshold
+
+                hard_idx = torch.where(hard_mask)[0]
+                easy_idx = torch.where(easy_mask)[0]
+
+                hard_count = max(1, int(len(images) * slice_hard_ratio))
+                easy_count = len(images) - hard_count
+
+                if len(hard_idx) > 0:
+                    hard_idx = hard_idx[torch.randperm(len(hard_idx))[:hard_count]]
+                if len(easy_idx) > 0:
+                    easy_idx = easy_idx[torch.randperm(len(easy_idx))[:easy_count]]
+
+                use_idx = torch.cat([hard_idx, easy_idx])
+                images = images[use_idx]
+                labels = labels[use_idx]
+                confidence = confidence[use_idx]
+                mask = None
+
+            if mask is not None:
+                if mask.sum() == 0:
+                    continue
+                images = images[mask]
+                labels = labels[mask]
+                confidence = confidence[mask]
+
+            # Log slice stats
+            if batch % 50 == 0:
+                selected_ratio = len(images) / batch["image"].shape[0]
+                LOGGER.info(f"[SliceTrain] epoch={epoch}, step={batch}, selected={selected_ratio:.2f}")
+
         # === Apply GPU augment only during training ===
         if train_mode:
             if images.dtype != torch.float32:
@@ -1416,6 +1478,12 @@ def _run_epoch(
     label_pos_ratio = total_pos_labels / stats["samples"] if stats["samples"] > 0 else 0.0
     pred_pos_ratio = total_pos_preds / stats["samples"] if stats["samples"] > 0 else 0.0
     
+
+    if slice_enabled:
+        hard_ratio = (confidence < config.slice_medium_threshold).float().mean().item()
+        train_metrics["hard_ratio"] = hard_ratio
+        writer.add_scalar("slice/hard_ratio", hard_ratio, epoch)
+
     # 计算概率统计（如果收集了输出）
     prob_stats = ""
     if collect_outputs and collected_probs:
@@ -2340,6 +2408,56 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             margin_method=config.margin_method,
             ema=ema,  # 训练阶段更新 EMA
         )
+
+        # ==========================================
+        # 🔥 Slice Training Trigger
+        # ==========================================
+        if (
+            config.enable_slice_training and
+            epoch == 1 and
+            not (config.output_dir / "confidence.csv").exists()
+        ):
+            LOGGER.info("[Slice Training] Warmup Finished — Generating confidence.csv ...")
+
+            # --- Step 1: Collect confidence from validation set ---
+            confidence_records = []
+            model.eval()
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc="Scoring confidence"):
+                    images = batch["image"].to(device)
+                    labels = batch["label"].cpu().numpy()
+                    logits = model(images)
+
+                    if logits.ndim == 2:  # CosFace / Softmax style -> use class 1 logit
+                        logits = logits[:, 1]
+
+                    probs = torch.sigmoid(logits).cpu().numpy()
+
+                    for i, p in enumerate(probs):
+                        confidence_records.append({
+                            "path": batch["path"][i],
+                            "label": labels[i],
+                            "confidence": float(abs(p - 0.5) * 2),  # uncertainty-based confidence
+                        })
+
+            # --- Step 2: Save confidence.csv ---
+            df = pd.DataFrame(confidence_records)
+            df.to_csv(config.output_dir / "confidence.csv", index=False)
+            LOGGER.info(f"[Slice Training] confidence.csv saved ({len(df)} samples).")
+
+            # --- Step 3: Reload dataset with slice curriculum ---
+            from .data import OCECDataset  
+
+            confidence_dict = dict(zip(df.path, df.confidence))
+
+            train_dataset = OCECDataset(splits["train"], train_transform, confidence_dict)
+            val_dataset   = OCECDataset(splits["val"],   eval_transform, confidence_dict)
+
+            train_loader = create_dataloader(train_dataset, config.batch_size, shuffle=True, num_workers=config.num_workers)
+            val_loader   = create_dataloader(val_dataset,   config.batch_size, shuffle=False, num_workers=config.num_workers)
+
+            LOGGER.info("[Slice Training] Dataset rebuilt. Training will continue with sliced difficulty schedule.")
+
         # 只在特定epoch保存训练集embedding（每50个epoch或第一个epoch）
         if (epoch == 1 or epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
             LOGGER.info("Saving training embeddings for TensorBoard Projector...")
