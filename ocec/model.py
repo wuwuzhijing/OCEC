@@ -37,29 +37,47 @@ class ArcFaceHead(nn.Module):
 
 
 class CosFaceHead(nn.Module):
-    """CosFace (AM-Softmax): Additive Margin Softmax Loss"""
-    def __init__(self, embedding_dim, num_classes=2, s=30.0, s_val = 10.0, m=0.35):
+    """
+    CosFace with margin warmup:
+    
+    m_effective = m * min(1, epoch / warmup_epochs)
+    """
+    def __init__(self, embedding_dim, num_classes=2, m=0.35, s=8.0, warmup_epochs=10, s_val=4.0):
         super().__init__()
-        self.s = s
-        self.s_val = s_val
         self.m = m
+        self.s = s
+        self.s_val = s_val  # used in eval
+        self.warmup_epochs = warmup_epochs
         self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
         nn.init.xavier_uniform_(self.weight)
 
-    def forward(self, embedding, labels=None):
-        emb = F.normalize(embedding, dim=1) # 将embedding映射到超球面，保留方向结构信息，不仅仅有模长信息
-        w = F.normalize(self.weight, dim=1) # 两个分类方向归一化为单位向量
-        logits = F.linear(emb, w)   # 余弦相似度
+        # running value for tensorboard/debug
+        self.current_margin = 0.0
+
+    def forward(self, embedding, labels=None, epoch=None):
+        """
+        If labels=None → eval mode → no margin applied (but classifier still used).
+        """
+        emb = F.normalize(embedding, dim=1)
+        w = F.normalize(self.weight, dim=1)
+
+        logits = torch.matmul(emb, w.t())  # cosine similarity
 
         if labels is None:
-            # 验证/推理时：返回不带 scale 的 logits，避免概率分布过于极端
-            # 或者使用较小的 scale 来软化分布
-            return logits * self.s_val  # scale减小，让 softmax 产生更合理的概率分布
+            # eval: scale logits but DO NOT apply margin
+            return logits * self.s_val
 
-        # 训练时：CosFace: cos(θ) - m，然后乘以 scale
-        one_hot = F.one_hot(labels.long(), num_classes=2)
-        target_logits = logits - self.m * one_hot
-        return target_logits * self.s
+        # ---- margin warmup ----
+        if epoch is not None and self.warmup_epochs > 0:
+            warm_factor = min(1.0, float(epoch) / float(self.warmup_epochs))
+            self.current_margin = self.m * warm_factor
+        else:
+            self.current_margin = self.m
+
+        one_hot = F.one_hot(labels.long(), num_classes=logits.size(1)).float().to(logits.device)
+
+        logits_margin = logits - one_hot * self.current_margin
+        return logits_margin * self.s
     
 @dataclass
 class ModelConfig:
@@ -472,7 +490,7 @@ class OCEC(nn.Module):
                 #| 64–128        | **16–32** |
                 #| 32–64         | **8–20**  |
                 # 推理 scale 一般占训练 scale 的 30–50%
-                self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.25, s=24, s_val=10)
+                self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.18, s=12, s_val=6)
         else:
             self.margin_head = None
 
@@ -487,7 +505,7 @@ class OCEC(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, labels=None, return_embedding=False, training=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, labels=None, return_embedding=False, training=None, epoch=None) -> torch.Tensor:
         """
         Args:
             x: 输入图像
@@ -517,19 +535,21 @@ class OCEC(nn.Module):
             logits = logits.squeeze(1)
 
         if self.margin_head is not None:
-            # Margin-based loss (CosFace): 训练时使用 labels 和 margin，验证/推理时不使用 margin
-            # 通过 self.training 判断是否在训练模式
-            # 验证/推理时即使有 labels 也不使用 margin，确保行为一致
-            # use_margin = (training is not None and training) or (training is None and self.training)
-            
-            # 训练时：使用 margin_head 的 logits（带 margin）
-            margin_labels = labels
-            if return_embedding:
-                logits_margin = self.margin_head(embedding, margin_labels)
-                return logits_margin, embedding
-            else:
-                logits_margin = self.margin_head(embedding, margin_labels)
+            # Determine if margin applies (training only)
+            use_margin = (training is not None and training) or (training is None and self.training)
+
+            if use_margin:
+                # Training: apply margin warmup
+                logits_margin = self.margin_head(embedding, labels=labels, epoch=epoch)
+                if return_embedding:
+                    return logits_margin, embedding
                 return logits_margin
+            else:
+                # Eval/inference → No margin but scaled logits
+                logits_no_margin = self.margin_head(embedding, labels=None)
+                if return_embedding:
+                    return logits_no_margin, embedding
+                return logits_no_margin
 
         # 不使用 margin
         if return_embedding:

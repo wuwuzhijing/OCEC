@@ -281,8 +281,6 @@ def detect_hard_samples(probs, labels, margin_th=0.15):
     hard_idx = np.where(margin < margin_th)[0]
     return [(int(i), float(probs[i]), int(labels[i])) for i in hard_idx]
 
-
-
 def detect_mislabeled(probs, labels, emb, threshold=0.15):
     # 思路：高置信度预测与标签冲突 + embedding 位置偏离
     import numpy as np
@@ -296,80 +294,53 @@ def detect_mislabeled(probs, labels, emb, threshold=0.15):
     return wrong
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2, alpha=0.5, reduction="mean"):
+    def __init__(self, gamma=2.0, alpha=1.0, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
         self.reduction = reduction
 
+    # def forward(self, logits, targets):
+    #     # logits: [B,2]
+    #     # targets: [B]
+
+    #     ce_loss = F.cross_entropy(logits, targets, reduction='none')  # [B]
+
+    #     # 计算 softmax 概率
+    #     probs = torch.softmax(logits, dim=1)  # [B,2]
+    #     # 取出真实类别概率
+    #     pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [B]
+
+    #     focal_term = (1 - pt) ** self.gamma  # [B]
+    #     loss = self.alpha * focal_term * ce_loss  # [B]
+
+    #     return loss.mean() if self.reduction=='mean' else loss.sum()
+
     def forward(self, logits, targets):
-        """logits: (B,2), targets: (B,)"""
-        ce_loss = F.cross_entropy(logits, targets, reduction="none")  # 不reduce
-        pt = torch.exp(-ce_loss)  # softmax 后的概率（来自 CE）
-        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss)
+        # logits: [B,2] (CosFace 输出)
+        # targets: may be float (soft) or long (hard)
 
-        return focal_loss.mean() if self.reduction == "mean" else focal_loss.sum()
-            
-class FocalLabelSmoothCE(nn.Module):
-    def __init__(self, smoothing=0.05, gamma=2.0):
-        super().__init__()
-        self.smoothing = smoothing
-        self.gamma = gamma
+        log_probs = torch.log_softmax(logits, dim=1)   # [B,2]
+        probs = torch.softmax(logits, dim=1)           # [B,2]
 
-    def forward(self, logits, labels):
-        """
-        logits: [B, 2] 或 [B] 或 [B, 1]
-        labels: [B]
-        """
-        # 处理单个分数的情况：将 [B] 或 [B, 1] 转换为 [B, 2]
-        if logits.ndim == 1:
-            # [B] -> [B, 2]: 第一列是闭眼分数(-logit)，第二列是睁眼分数(logit)
-            logits = torch.stack([-logits, logits], dim=1)
-        elif logits.ndim == 2 and logits.size(1) == 1:
-            # [B, 1] -> [B, 2]
-            logits = logits.squeeze(1)
-            logits = torch.stack([-logits, logits], dim=1)
-        
-        num_classes = logits.size(1)
+        # --- Create one-hot target (supports soft labels) ---
+        if targets.dtype == torch.long:
+            target_onehot = torch.zeros_like(probs)
+            target_onehot.scatter_(1, targets.unsqueeze(1), 1.0)
+        else:
+            # Soft label case: target is probability of class1
+            target_onehot = torch.zeros_like(probs)
+            target_onehot[:, 1] = targets
+            target_onehot[:, 0] = 1 - targets
 
-        # ===== Label smoothing =====
-        with torch.no_grad():
-            true_dist = torch.zeros_like(logits)
-            true_dist.fill_(self.smoothing / (num_classes - 1))
-            true_dist.scatter_(1, labels.unsqueeze(1), 1 - self.smoothing)
+        # --- Focal loss core ---
+        pt = (probs * target_onehot).sum(dim=1)      # [B]
+        focal_term = (1 - pt).pow(self.gamma)
 
-        # ===== Softmax =====
-        probs = torch.softmax(logits, dim=1)
+        ce = -(target_onehot * log_probs).sum(dim=1) # CE
+        loss = (focal_term * ce).mean()
 
-        # ===== Cross entropy =====
-        ce_loss = -(true_dist * torch.log(probs + 1e-7)).sum(dim=1)
-
-        # ===== Focal term =====
-        pt = probs.gather(1, labels.unsqueeze(1)).squeeze()  # p_t
-        focal_weight = (1 - pt) ** self.gamma
-
-        loss = focal_weight * ce_loss
-        return loss.mean()
-    
-class FocalLabelSmoothLoss(nn.Module):
-    def __init__(self, smoothing=0.05, gamma=2.0):
-        super().__init__()
-        self.smoothing = smoothing
-        self.gamma = gamma
-
-    def forward(self, logits, labels):
-        labels = labels.float()
-        with torch.no_grad():
-            smooth = labels * (1 - self.smoothing) + 0.5 * self.smoothing
-
-        prob = torch.sigmoid(logits)
-        bce = F.binary_cross_entropy(prob, smooth, reduction='none')
-
-        pt = prob * labels + (1 - prob) * (1 - labels)
-        focal = (1 - pt) ** self.gamma
-
-        return (focal * bce).mean()
-    
+        return loss  
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -396,7 +367,11 @@ class EMA:
             if key.startswith("module."):
                 key = key[7:]
 
-            assert key in self.shadow, f"[EMA] Missing key: {key}"
+            # 如果在初始化时该参数被冻结，shadow 中可能不存在，补充初始化
+            if key not in self.shadow:
+                self.shadow[key] = p.data.clone()
+                continue
+
             new_average = (1.0 - self.decay) * p.data + self.decay * self.shadow[key]
             self.shadow[key] = new_average.clone()
 
@@ -866,6 +841,9 @@ class TrainConfig:
     slice_medium_threshold: float = 0.60
     slice_stage_epochs: tuple = (85, 95)  # (easy_end, medium_end)
     slice_hard_ratio: float = 0.20  # 10–20% hard samples
+    enable_pseudo_label: bool = True
+    pseudo_conf_threshold: float = 0.35
+    pseudo_update_start_epoch: int = 10
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1278,104 +1256,95 @@ def _run_epoch(
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
-        
+
         with _autocast(autocast_enabled):
-            logits, embedding = model(images, labels=labels, return_embedding=True)
-            use_margin = margin_method in ["arcface", "cosface"]
-            if use_margin:
-                # 损失函数使用带 margin 的 logits（训练时）
-                # 验证时，如果 logits 不是 [B, 2] 形状，说明使用的是原始 head，需要特殊处理
-                if train_mode:
-                    # 训练时：使用 CrossEntropyLoss，logits 应该是 [B, 2] 形状
-                    # loss = criterion(logits, labels.long())
-                    loss = focal_loss(logits, labels)
+            # ---- Forward ----
+            forward_out = model(images, labels=labels, return_embedding=True, training=train_mode, epoch=epoch)
+            
+            logits, embedding = forward_out
+
+            # ---- Unified probability calculation (ALWAYS from margin_head if enabled) ----
+            with torch.no_grad():
+                if hasattr(model, "module"):
+                    margin_head = model.module.margin_head
                 else:
-                    # 验证时：根据 logits 形状选择合适的损失函数
+                    margin_head = model.margin_head
+
+                if margin_method in ["arcface", "cosface"] and margin_head is not None:
+                    clean_logits = margin_head(embedding, labels=None)
+                    probs = torch.softmax(clean_logits, dim=1)[:, 1]
+                else:
+                    # fallback to BCE-style or raw logits if no margin_head active
                     if logits.ndim == 2 and logits.size(1) == 2:
-                        # [B, 2] 形状：使用 CrossEntropyLoss
-                        # loss = criterion(logits, labels.long())
-                        loss = focal_loss(logits, labels)
+                        probs = torch.softmax(logits, dim=1)[:, 1]
                     else:
-                        # [B] 或 [B, 1] 形状：使用 BCEWithLogitsLoss
-                        logits_bce = logits.squeeze(1) if logits.ndim == 2 and logits.size(1) == 1 else logits
-                        # 创建一个临时的 BCE 损失函数（不使用 pos_weight，因为验证时不需要）
-                        bce_criterion = nn.BCEWithLogitsLoss()
-                        loss = bce_criterion(logits_bce, labels.float())
-                
-                # 计算指标时，训练和验证都使用 margin_head（labels=None，不应用 margin）
-                # 关键修复：确保训练和验证使用同一个分类器，指标计算方式一致
-                if train_mode:
-                    # 训练时：使用 margin_head 的 logits（labels=None，不应用 margin）用于指标计算
-                    # 这样训练和验证的指标计算方式一致，更准确反映模型性能
-                    with torch.no_grad():
-                        # 获取 margin_head 的 logits（labels=None 时不应用 margin）
-                        # 注意：需要从模型内部获取 margin_head，支持 DataParallel
-                        if hasattr(model, 'module'):  # DataParallel 包装
-                            margin_head = model.module.margin_head
-                        else:
-                            margin_head = model.margin_head
-                        
-                        if margin_head is not None:
-                            # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
-                            logits_no_margin = margin_head(embedding, labels=None)#已经在模型中定义好了
-                            # 应用 scale 以匹配训练时的 logits 范围
-                            logits_no_margin_scaled = logits_no_margin
-                            # 使用 softmax 计算概率
-                            probs = torch.softmax(logits_no_margin_scaled, dim=1)[:, 1]
-                            logits_for_debug = logits_no_margin_scaled
-                            confidence = probs.cpu()
-                        else:
-                            # 如果没有 margin_head（不应该发生），回退到原始 logits
-                            LOGGER.warning("Training: margin_method is set but margin_head is None, using original logits")
-                            if logits.ndim == 2 and logits.size(1) == 2:
-                                probs = torch.softmax(logits, dim=1)[:, 1]
-                            else:
-                                logits_bce = logits.squeeze(1) if logits.ndim == 2 and logits.size(1) == 1 else logits
-                                probs = torch.sigmoid(logits_bce)
-                            logits_for_debug = logits
-                else:
-                    # 验证时：使用 margin_head 的 logits（labels=None，不应用 margin，但使用同一个分类器）
-                    # 关键修复：训练和验证必须使用同一个分类器（margin_head），否则会导致指标不一致
-                    # 训练时：margin_head(embedding, labels) -> 带 margin 和 scale 的 logits
-                    # 验证时：margin_head(embedding, labels=None) -> 不带 margin 但带 scale 的 logits
-                    with torch.no_grad():
-                        # 获取 margin_head 的 logits（labels=None 时不应用 margin）
-                        # 注意：需要从模型内部获取 margin_head，支持 DataParallel
-                        if hasattr(model, 'module'):  # DataParallel 包装
-                            margin_head = model.module.margin_head
-                        else:
-                            margin_head = model.margin_head
-                        
-                        if margin_head is not None:
-                            # 使用 margin_head 获取 logits（labels=None 时不应用 margin）
-                            logits_margin = margin_head(embedding, labels=None)  # (B, 2)，范围 [-1, 1]
-                            # 应用 scale 以匹配训练时的 logits 范围
-                            logits_margin_scaled = logits_margin * margin_head.s_val  # (B, 2)，范围约 [-s, s]
-                            # 使用 softmax 计算概率
-                            probs = torch.softmax(logits_margin_scaled, dim=1)[:, 1]
-                            logits_for_debug = logits_margin_scaled
-                        else:
-                            # 如果没有 margin_head（不应该发生，因为 use_margin=True），回退到原始逻辑
-                            LOGGER.warning("Validation: margin_method is set but margin_head is None, using original logits")
-                            if logits.ndim == 2 and logits.size(1) == 2:
-                                probs = torch.softmax(logits, dim=1)[:, 1]
-                            elif logits.ndim == 2 and logits.size(1) == 1:
-                                probs = torch.sigmoid(logits.squeeze(1))
-                            elif logits.ndim == 1:
-                                probs = torch.sigmoid(logits)
-                            else:
-                                probs = torch.sigmoid(logits.squeeze() if logits.ndim > 1 else logits)
-                            logits_for_debug = logits
+                        probs = torch.sigmoid(logits.squeeze())
+
+            # ---- Pseudo label update ----
+            if train_mode and epoch >= 10:
+                pseudo_labels = labels.clone().float()
+                uncertain_mask = (probs > 0.3) & (probs < 0.7)
+
+                # assign soft label but only where uncertain
+                pseudo_labels[uncertain_mask] = probs[uncertain_mask].to(pseudo_labels.dtype)
+                used_labels = pseudo_labels   # mixed (hard + soft)
             else:
-                if logits.ndim == 2 and logits.shape[1] == 2:
-                    logits_bce = logits[:, 1]
+                used_labels = labels.float()  # consistent dtype later
+
+            # ---- Loss scheduling ----
+            if epoch < 15:
+                # Warmup: smooth CE (hard labels only)
+                ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+                # ensure logits shape is [B,2]
+                if logits.ndim == 1:
+                    logits = logits.unsqueeze(1)
+
+                if logits.size(1) == 1:
+                    logits = torch.cat([-logits, logits], dim=1)  # binary -> 2 class
+                if used_labels.dtype == torch.long:
+                    loss = ce_loss_fn(logits, used_labels)
                 else:
-                    logits_bce = logits
-                loss = criterion(logits_bce, labels.float())
-                
-                probs = torch.sigmoid(logits_bce)
-                logits_for_debug = logits
-        
+                    log_prob = torch.log_softmax(logits, dim=1)
+                    soft_target = torch.stack([1 - used_labels, used_labels], dim=1)
+                    loss = -(soft_target * log_prob).sum(dim=1).mean()
+
+            elif epoch < 30:
+                # Hybrid stage: CE + focal progressively blend
+                focal_loss_fn = FocalLoss(gamma=1.0, alpha=0.75, reduction="mean")
+                ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+
+                hybrid_ratio = (epoch - 15) / 15  # linearly 0→1
+
+                # ensure logits shape is [B,2]
+                if logits.ndim == 1:
+                    logits = logits.unsqueeze(1)
+
+                if logits.size(1) == 1:
+                    logits = torch.cat([-logits, logits], dim=1)  # binary -> 2 class
+                # Hard cross entropy
+                ce_hard = ce_loss_fn(logits, labels.long())
+
+                # Soft cross entropy (for pseudo-labeled samples)
+                ce_soft = -(
+                    used_labels * torch.log_softmax(logits, dim=1)[:, 1] +
+                    (1 - used_labels) * torch.log_softmax(logits, dim=1)[:, 0]
+                ).mean()
+
+                # focal using soft labels
+                focal_soft = focal_loss_fn(logits, used_labels)
+
+                # total
+                loss = (1 - hybrid_ratio) * ce_hard + 0.5 * hybrid_ratio * ce_soft + 0.5 * hybrid_ratio * focal_soft
+
+            else:
+                # Full adaptive focal w/ soft labels
+                focal_loss_fn = FocalLoss(gamma=1.0, alpha=0.75, reduction="mean")
+                loss = focal_loss_fn(logits, used_labels)
+
+            # ---- Logging values for visualization ----
+            logits_for_debug = logits
+            confidence = probs.clone().detach().cpu()
+
         if train_mode:
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1388,7 +1357,6 @@ def _run_epoch(
             if ema is not None:
                 ema.update(model)
 
-             
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
         stats["samples"] += batch_size
@@ -2075,9 +2043,9 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     train_transform, eval_transform = _build_transforms(config.image_size, mean, std)
     normalization = {"mean": list(mean), "std": list(std), "image_size": list(config.image_size)}
 
-    train_dataset = OCECDataset(splits["train"], transform=train_transform)
-    val_dataset = OCECDataset(splits["val"], transform=eval_transform) if splits["val"] else None
-    test_dataset = OCECDataset(splits["test"], transform=eval_transform) if splits["test"] else None
+    train_dataset = OCECDataset(splits["train"], transform=train_transform, confidence_dict=None)
+    val_dataset = OCECDataset(splits["val"], transform=eval_transform, confidence_dict=None) if splits["val"] else None
+    test_dataset = OCECDataset(splits["test"], transform=eval_transform, confidence_dict=None) if splits["test"] else None
 
     # train_sampler = build_weighted_sampler(splits["train"])
     train_loader = create_dataloader(
@@ -2146,7 +2114,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         LOGGER.info(f"Loaded {len(pretrain_dict)}/{len(model_dict)} layers from pretrain checkpoint")
     
     # 冻结backbone（如果指定）
-    if config.freeze_backbone:
+    if config.freeze_backbone and config.margin_method == "none":#cosface情形下不冻结backbone
         _freeze_backbone(model)
         LOGGER.info("Backbone frozen: only head and margin_head will be trained")
     
@@ -2357,10 +2325,19 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 start_epoch - 1,
                 config.epochs,
             )
-
+    # 使用 None 初始化，保持类型一致（后续按字典访问）
+    val_metrics = None
     for epoch in range(start_epoch, config.epochs + 1):
-        # 检查是否需要解冻backbone（渐进式微调）
-        if config.unfreeze_backbone_epoch is not None and epoch == config.unfreeze_backbone_epoch:
+        LOGGER.info(f"Epoch {epoch}/{config.epochs}")
+        
+        if hasattr(model, "module"):
+            model_dict = model.module
+            model_dict.current_epoch = epoch
+        else:
+            model_dict = model.module
+            model_dict.current_epoch = epoch
+
+        if config.unfreeze_backbone_epoch is not None and epoch >= config.unfreeze_backbone_epoch and config.margin_method == "none":
             # 检查第一阶段效果（如果验证集F1达到目标，才解冻）
             if val_metrics is not None and val_metrics.get("f1", 0) >= 0.80:
                 LOGGER.info(f"Epoch {epoch}: Stage 1 F1={val_metrics['f1']:.4f} >= 0.80, proceeding to Stage 2")
@@ -2404,6 +2381,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             collect_outputs=True,
             margin_method=config.margin_method,
             ema=ema,  # 训练阶段更新 EMA
+            epoch=epoch,
         )
 
         # ---- Hard sample stats (only if slice enabled & outputs available) ----
@@ -2503,7 +2481,6 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             LOGGER.info(f"[Slice Training] confidence.csv saved ({len(df)} samples).")
 
             # --- Step 3: Reload dataset with slice curriculum ---
-            from .data import OCECDataset  
 
             confidence_dict = dict(zip(df.path, df.confidence))
 
@@ -2516,7 +2493,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             LOGGER.info("[Slice Training] Dataset rebuilt. Training will continue with sliced difficulty schedule.")
 
         # 只在特定epoch保存训练集embedding（每50个epoch或第一个epoch）
-        if (epoch == 1 or epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
+        if (epoch > 1 and epoch % 50 == 0) and train_outputs is not None and train_outputs["embeddings"] is not None:
             LOGGER.info("Saving training embeddings for TensorBoard Projector...")
             save_embeddings_for_projector(
                 tb_writer,
@@ -2545,13 +2522,37 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 collect_outputs=True,
                 margin_method=config.margin_method,
                 ema=None,  # 验证阶段不再更新 EMA，只使用 apply() 后的权重
+                epoch=epoch,
             )
+            
+            if (config.enable_pseudo_label and epoch >= config.pseudo_update_start_epoch and train_outputs is not None):
+                probs = train_outputs["probs"]
+                labels = train_outputs["labels"]
+
+                # 高置信样本 mask
+                high_mask = np.abs(probs - 0.5) > config.pseudo_conf_threshold  # <- 参数生效位置
+
+                new_labels = labels.copy()
+                new_labels[high_mask] = (probs[high_mask] >= 0.5).astype(int)
+
+                # 写回 dataset
+                # for i, s in enumerate(train_dataset.samples):
+                #     s.label = int(new_labels[i])
+                #     LOGGER.warning(f"[Pseudo-Label Update] Applied to {high_mask.sum()} samples")
+            # Log dynamic margin for debugging / monitoring
+            mh = model.module.margin_head if hasattr(model, "module") else model.margin_head
+            if mh is not None:
+                warm_factor = min(1.0, epoch / mh.warmup_epochs)
+                mh.current_margin = mh.m * warm_factor
+                tb_writer.add_scalar("margin/current_margin", mh.current_margin, epoch)
+    
             if (epoch > 10 and epoch < 50 and epoch % 5 == 0) or (epoch > 50 and epoch % 10 == 0) or (epoch == config.epochs):
                 sweep_result = sweep_thresholds(val_outputs["probs"], val_outputs["labels"])
                 best_thr = sweep_result["best_threshold"]
+                CONF_THRESHOLD = best_thr
                 best_f1 = sweep_result["best_f1"]
                 LOGGER.info(f"🔍 Best threshold sweep result -> threshold={best_thr:.4f}, f1={best_f1:.4f}")
-                plot_threshold_curve(sweep_result["curve"], f"{output_dir}/threshold_sweep_epoch{epoch:04d}.png")
+                plot_threshold_curve(sweep_result["curve"], f"{config.output_dir}/threshold_sweep_epoch{epoch:04d}.png")
 
             if epoch % 50 == 0:
                 if val_outputs is not None and val_outputs["embeddings"] is not None:
@@ -2574,18 +2575,18 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                     ]
 
                     # 聚类小眼睛（需要sklearn）
-                    try:
-                        cluster_small_eye(
-                            emb=val_outputs["embeddings"],
-                            labels=val_outputs["labels"],
-                            image_paths=val_image_paths,
-                            save_root=str(config.output_dir / f"clusters_epoch{epoch:04d}"),
-                            n_clusters=5,
-                        )
-                    except ImportError as e:
-                        LOGGER.warning(f"Skipping clustering (sklearn not available): {e}")
-                    except Exception as e:
-                        LOGGER.warning(f"Failed to cluster small eyes: {e}")
+                    # try:
+                    #     cluster_small_eye(
+                    #         emb=val_outputs["embeddings"],
+                    #         labels=val_outputs["labels"],
+                    #         image_paths=val_image_paths,
+                    #         save_root=str(config.output_dir / f"clusters_epoch{epoch:04d}"),
+                    #         n_clusters=5,
+                    #     )
+                    # except ImportError as e:
+                    #     LOGGER.warning(f"Skipping clustering (sklearn not available): {e}")
+                    # except Exception as e:
+                    #     LOGGER.warning(f"Failed to cluster small eyes: {e}")
                     
                     # 双PCA可视化（需要sklearn）
                     try:
@@ -2615,7 +2616,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             model.train()
         else:
             val_metrics, val_outputs = None, None
-        if epoch % 10 == 0:
+        if epoch % 50 == 0:
             log_all_separation_metrics("train", train_outputs, epoch, tb_writer, config)
             log_all_separation_metrics("val",   val_outputs,   epoch, tb_writer, config)     
                
@@ -2756,6 +2757,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             autocast_enabled=amp_enabled,
             progress_desc="Test",
             margin_method=config.margin_method,
+            epoch=epoch,
         )
     LOGGER.info("Test metrics: %s", json.dumps(test_metrics, indent=2) if test_metrics else "n/a")
     if test_metrics:
