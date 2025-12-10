@@ -830,20 +830,20 @@ class TrainConfig:
     token_mixer_layers: int = 2
     device: str = "auto"
     resume_from: Optional[Path] = None
-    pretrain_from: Optional[Path] = None  # 预训练权重路径（只加载模型权重，不恢复训练状态）
+    pretrain_from: Optional[Path] = None
     use_amp: bool = False
-    warmup_epochs: int = 5  # Warmup阶段的epoch数，0表示不使用warmup
-    freeze_backbone: bool = False  # 是否冻结backbone（只训练head）
-    unfreeze_backbone_epoch: Optional[int] = None  # 在指定epoch解冻backbone（用于渐进式微调）
-    stage2_lr: Optional[float] = None  # 第二阶段学习率（如果为None，则使用lr * 0.05）
+    warmup_epochs: int = 5
+    freeze_backbone: bool = False
+    unfreeze_backbone_epoch: Optional[int] = None
+    stage2_lr: Optional[float] = None
     enable_slice_training: bool = False
     slice_easy_threshold: float = 0.85
     slice_medium_threshold: float = 0.60
-    slice_stage_epochs: tuple = (85, 95)  # (easy_end, medium_end)
-    slice_hard_ratio: float = 0.20  # 10–20% hard samples
+    slice_stage_epochs: tuple = (85, 95)
+    slice_hard_ratio: float = 0.20
     enable_pseudo_label: bool = True
     pseudo_conf_threshold: float = 0.35
-    pseudo_update_start_epoch: int = 10
+    pseudo_update_start_epoch: int = 25
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1166,7 +1166,8 @@ def _run_epoch(
     slice_stage_epochs: tuple = (85, 95),
     slice_easy_threshold: float = 0.85,
     slice_medium_threshold: float = 0.60, 
-    slice_hard_ratio: float = 0.20
+    slice_hard_ratio: float = 0.20,
+    pseudo_start_epoch: int = 10,
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
@@ -1181,10 +1182,12 @@ def _run_epoch(
 
     train_mode = optimizer is not None
     model.train(mode=train_mode)
+    split_name = "Train" if train_mode else "Val"
 
     stats = {"loss": 0.0, "samples": 0, "tp": 0, "tn": 0, "fp": 0, "fn": 0}
     collected_probs: List[torch.Tensor] = []
     collected_labels: List[torch.Tensor] = []
+    margin_stats = None
 
     iterator = dataloader
     if progress_desc:
@@ -1281,9 +1284,9 @@ def _run_epoch(
                         probs = torch.sigmoid(logits.squeeze())
 
             # ---- Pseudo label update ----
-            if train_mode and epoch >= 10:
+            if train_mode and epoch >= pseudo_start_epoch:
                 pseudo_labels = labels.clone().float()
-                uncertain_mask = (probs > 0.3) & (probs < 0.7)
+                uncertain_mask = (probs > 0.4) & (probs < 0.6)
 
                 # assign soft label but only where uncertain
                 pseudo_labels[uncertain_mask] = probs[uncertain_mask].to(pseudo_labels.dtype)
@@ -1310,7 +1313,10 @@ def _run_epoch(
 
             elif epoch < 30:
                 # Hybrid stage: CE + focal progressively blend
-                focal_loss_fn = FocalLoss(gamma=1.0, alpha=0.75, reduction="mean")
+                pos_ratio = labels.float().mean().item()
+                neg_ratio = 1.0 - pos_ratio
+                alpha_dyn = neg_ratio  # alpha = neg / total
+                focal_loss_fn = FocalLoss(gamma=1.0, alpha=alpha_dyn, reduction="mean")
                 ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
 
                 hybrid_ratio = (epoch - 15) / 15  # linearly 0→1
@@ -1338,7 +1344,10 @@ def _run_epoch(
 
             else:
                 # Full adaptive focal w/ soft labels
-                focal_loss_fn = FocalLoss(gamma=1.0, alpha=0.75, reduction="mean")
+                pos_ratio = labels.float().mean().item()
+                neg_ratio = 1.0 - pos_ratio
+                alpha_dyn = neg_ratio  # alpha = neg / total
+                focal_loss_fn = FocalLoss(gamma=1.0, alpha=alpha_dyn, reduction="mean")
                 loss = focal_loss_fn(logits, used_labels)
 
             # ---- Logging values for visualization ----
@@ -1355,7 +1364,7 @@ def _run_epoch(
                 optimizer.step()
             # 仅在训练阶段且提供了 EMA 对象时更新 EMA 权重
             if ema is not None:
-                ema.update(model)
+                    ema.update(model)
 
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
@@ -1377,6 +1386,42 @@ def _run_epoch(
             if 'logits_for_debug' not in locals():
                 logits_for_debug = logits
             debug_logits = logits_for_debug
+            # === Margin vs Non-margin stats (first batch of epoch) ===
+            if margin_method in ["arcface", "cosface"] and margin_head is not None:
+                clean_logits = margin_head(embedding, labels=None)
+                if train_mode:
+                    margin_logits = logits.detach()
+                else:
+                    # 验证阶段 forward 默认返回无 margin，这里仅用于对比
+                    if margin_method == "cosface":
+                        margin_logits = margin_head(embedding, labels=labels.long(), epoch=epoch)
+                    else:
+                        margin_logits = margin_head(embedding, labels=labels.long())
+
+                def _tensor_stats(t: torch.Tensor) -> dict:
+                    t_det = t.detach()
+                    return {
+                        "mean": t_det.mean().item(),
+                        "std": t_det.std().item(),
+                        "min": t_det.min().item(),
+                        "max": t_det.max().item(),
+                    }
+
+                margin_stats = {
+                    "clean_logit_stats": _tensor_stats(clean_logits[:, 1] if clean_logits.ndim == 2 else clean_logits),
+                    "margin_logit_stats": _tensor_stats(margin_logits[:, 1] if margin_logits.ndim == 2 else margin_logits),
+                    "mode": "train" if train_mode else "val",
+                }
+
+                LOGGER.info(
+                    f"{split_name} margin logits (class1) -> "
+                    f"with_margin: mean={margin_stats['margin_logit_stats']['mean']:.3f}, "
+                    f"std={margin_stats['margin_logit_stats']['std']:.3f}, "
+                    f"range=[{margin_stats['margin_logit_stats']['min']:.3f}, {margin_stats['margin_logit_stats']['max']:.3f}]; "
+                    f"no_margin: mean={margin_stats['clean_logit_stats']['mean']:.3f}, "
+                    f"std={margin_stats['clean_logit_stats']['std']:.3f}, "
+                    f"range=[{margin_stats['clean_logit_stats']['min']:.3f}, {margin_stats['clean_logit_stats']['max']:.3f}]"
+                )
             if debug_logits.ndim == 2 and debug_logits.size(1) == 2:
                 logits_col0 = debug_logits[:, 0].detach()  # 闭眼类别的logit
                 logits_col1 = debug_logits[:, 1].detach()  # 睁眼类别的logit
@@ -1416,7 +1461,6 @@ def _run_epoch(
             batch_fp = ((preds == 1) & (labels_int == 0)).sum().item()
             batch_fn = ((preds == 0) & (labels_int == 1)).sum().item()
             batch_tn = ((preds == 0) & (labels_int == 0)).sum().item()
-            split_name = "Train" if train_mode else "Val"
             LOGGER.info(
                 f"{split_name} batch debug - logits shape: {debug_logits.shape}, "
                 f"logits ({logits_info}), "
@@ -1483,6 +1527,7 @@ def _run_epoch(
             "probs": all_probs.astype(float, copy=False),
             "labels": all_labels.astype(int, copy=False),
             "embeddings": torch.cat(all_embeddings).numpy() if all_embeddings else None,
+            "margin_stats": margin_stats,
         }
         
     return metrics, extras
@@ -1945,6 +1990,7 @@ def save_embeddings_for_projector(writer, emb, labels, epoch, projector_dir, spl
     print(f"[Projector] Saved: {N} {split} embeddings for epoch {epoch} (tensor shape: {emb_tensor.shape})")
     
 def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]:
+    global CONF_THRESHOLD  # 允许在函数内修改全局阈值
     # 创建带版本号的输出目录
     base_output_dir = config.output_dir
     version = 1
@@ -2113,8 +2159,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         model.load_state_dict(model_dict, strict=False)
         LOGGER.info(f"Loaded {len(pretrain_dict)}/{len(model_dict)} layers from pretrain checkpoint")
     
-    # 冻结backbone（如果指定）
-    if config.freeze_backbone and config.margin_method == "none":#cosface情形下不冻结backbone
+    # 冻结backbone
+    if config.freeze_backbone:
         _freeze_backbone(model)
         LOGGER.info("Backbone frozen: only head and margin_head will be trained")
     
@@ -2337,7 +2383,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             model_dict = model.module
             model_dict.current_epoch = epoch
 
-        if config.unfreeze_backbone_epoch is not None and epoch >= config.unfreeze_backbone_epoch and config.margin_method == "none":
+        if config.unfreeze_backbone_epoch is not None and epoch >= config.unfreeze_backbone_epoch:
             # 检查第一阶段效果（如果验证集F1达到目标，才解冻）
             if val_metrics is not None and val_metrics.get("f1", 0) >= 0.80:
                 LOGGER.info(f"Epoch {epoch}: Stage 1 F1={val_metrics['f1']:.4f} >= 0.80, proceeding to Stage 2")
@@ -2382,6 +2428,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             margin_method=config.margin_method,
             ema=ema,  # 训练阶段更新 EMA
             epoch=epoch,
+            pseudo_start_epoch=config.pseudo_update_start_epoch,
         )
 
         # ---- Hard sample stats (only if slice enabled & outputs available) ----
@@ -2665,10 +2712,19 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         tb_writer.add_scalar("loss/train", train_metrics["loss"], epoch)
         tb_writer.add_scalar("metrics/train_accuracy", train_metrics["accuracy"], epoch)
         tb_writer.add_scalar("metrics/train_f1", train_metrics["f1"], epoch)
+        # 记录 margin logits 统计到 TensorBoard（首个 batch 代表性采样）
+        if train_outputs is not None and train_outputs.get("margin_stats"):
+            ms = train_outputs["margin_stats"]
+            tb_writer.add_scalar("margin/train_with_margin_mean", ms["margin_logit_stats"]["mean"], epoch)
+            tb_writer.add_scalar("margin/train_no_margin_mean", ms["clean_logit_stats"]["mean"], epoch)
         if val_metrics is not None:
             tb_writer.add_scalar("loss/val", val_metrics["loss"], epoch)
             tb_writer.add_scalar("metrics/val_accuracy", val_metrics["accuracy"], epoch)
             tb_writer.add_scalar("metrics/val_f1", val_metrics["f1"], epoch)
+            if val_outputs is not None and val_outputs.get("margin_stats"):
+                ms = val_outputs["margin_stats"]
+                tb_writer.add_scalar("margin/val_with_margin_mean", ms["margin_logit_stats"]["mean"], epoch)
+                tb_writer.add_scalar("margin/val_no_margin_mean", ms["clean_logit_stats"]["mean"], epoch)
         tb_writer.flush()
 
         if train_outputs is not None:
@@ -3364,6 +3420,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of epochs for linear learning rate warmup (default: 5, set to 0 to disable).",
     )
+    train_parser.add_argument("--pseudo_update_start_epoch", type=int, default=25, help="Delay pseudo-labeling until this epoch.")
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -3465,6 +3522,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             freeze_backbone=args.freeze_backbone,
             unfreeze_backbone_epoch=args.unfreeze_backbone_epoch,
             stage2_lr=args.stage2_lr,
+            pseudo_update_start_epoch=args.pseudo_update_start_epoch,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

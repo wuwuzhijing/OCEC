@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ArcFaceHead(nn.Module):
     """ArcFace: Additive Angular Margin Loss"""
     def __init__(self, embedding_dim, num_classes=2, s=30.0, s_val = 10.0, m=0.50):
@@ -21,6 +20,8 @@ class ArcFaceHead(nn.Module):
     def forward(self, embedding, labels=None):
         emb = F.normalize(embedding, dim=1)
         w = F.normalize(self.weight, dim=1)
+        if w.dtype != emb.dtype:
+            w = w.to(emb.dtype)  # 避免 AMP 下 dtype 不一致
         logits = F.linear(emb, w)   # (B, 2)
 
         if labels is None:
@@ -34,7 +35,6 @@ class ArcFaceHead(nn.Module):
         one_hot = F.one_hot(labels.long(), num_classes=2)
         logits = logits * (1 - one_hot) + target_logits * one_hot
         return logits * self.s
-
 
 class CosFaceHead(nn.Module):
     """
@@ -60,6 +60,8 @@ class CosFaceHead(nn.Module):
         """
         emb = F.normalize(embedding, dim=1)
         w = F.normalize(self.weight, dim=1)
+        if w.dtype != emb.dtype:
+            w = w.to(emb.dtype)  # 避免 AMP 下半精度/全精度混算 dtype 不一致
 
         logits = torch.matmul(emb, w.t())  # cosine similarity
 
