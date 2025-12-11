@@ -1,2 +1,2 @@
-python -m ocec exportonnx --checkpoint runs/ocec_0-152470_1-144265/ocec_best_epoch0608_f1_0.9930.pt \
-       --output runs/ocec_0-152470_1-144265/ocec_best_epoch0608_f1_0.9930.onnx --opset 18
+python -m ocec exportonnx --checkpoint /103/guochuang/Code/myOCEC/runs/ocec_hq_finetune_progressive_v5.0/v1/ocec_best_epoch0249_f1_0.8607.pt \
+       --output /103/guochuang/Code/myOCEC/runs/ocec_hq_finetune_progressive_v5.0/v1/ocec_best_epoch0249_f1_0.8607.onnx --opset 18

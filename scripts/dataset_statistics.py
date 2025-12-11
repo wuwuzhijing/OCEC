@@ -5,23 +5,42 @@ from PIL import Image
 import numpy as np
 import argparse
 import matplotlib.pyplot as plt
+from pathlib import Path
 
-# --- 配置参数 ---
-CSV_DIR = '/ssddisk/guochuang/ocec/list_hq'
-REPORT_DIR = '/103/guochuang/Code/myOCEC/logs/dataset/list_hq/'
-REPORT_FILENAME = 'dataset_stats_report.txt'
-REPORT_PATH = os.path.join(REPORT_DIR, REPORT_FILENAME)
+# --- 路径     ---
+OCEC_DATA_ROOT = '/ssddisk/guochuang/ocec/'
+OCEC_CODE_ROOT = '/103/guochuang/Code/myOCEC/'
+OCEC_LOG_DIR   = OCEC_CODE_ROOT + 'logs'
+
 PIXEL_SAMPLE_LIMIT = 5000000  # 限制像素采样数量，避免内存溢出
 
 # 想要统计的 CSV 文件列表（请根据需要修改）
 CSV_FILENAMES = [
-    f"annotation_{i:04d}.csv" for i in range(24, 25)] + [
+    f"annotation_{i:04d}.csv" for i in range(1, 25)] + [
     f"cropped_merged_{i:01d}.csv" for i in range(0, 5)
 ]
 
-# ===============================================
-# A. 绘图函数
-# ===============================================
+def resolve_csv_files(args):
+    """根据运行模式选择 CSV 文件"""
+    csv_dir_path = Path(OCEC_DATA_ROOT) / args.csv_dir
+
+    # --- Mode 1: 从文件夹自动扫描 ---
+    if args.mode == "folder":
+        print(f"📂 扫描目录: {csv_dir_path}")
+        csv_files = sorted([f.name for f in csv_dir_path.glob("*.csv")])
+        return csv_files
+
+    # --- Mode 2: 使用指定或默认列表 ---
+    if args.mode == "list":
+        if args.csv_list:
+            print(f"📄 使用手动 CSV 列表: {args.csv_list}")
+            return args.csv_list
+        
+        print("📄 未指定列表，使用默认 CSV 名称模板。")
+        return (
+            [f"annotation_{i:04d}.csv" for i in range(1, 25)] +
+            [f"cropped_merged_{i:01d}.csv" for i in range(0, 5)]
+        )
 
 def plot_with_stats(data, title, xlabel, path):
     """绘制带统计标记的直方图"""
@@ -114,11 +133,6 @@ def plot_pixel_distribution(raw_pixels_sample, path):
     plt.close()
     print(f"✅ 像素分布图已保存: {path}")
     return path
-
-
-# ===============================================
-# B. 分析函数
-# ===============================================
 
 def analyze_dataset(csv_filenames, check_pixel_stats=False, generate_plots=False):
     # ... (初始化和日志函数与 V4.0 相同) ...
@@ -280,24 +294,34 @@ def analyze_dataset(csv_filenames, check_pixel_stats=False, generate_plots=False
     else:
         return None, None, None, None
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="数据集 CSV 文件统计工具 (V5.0 - 全面可视化)")
-    parser.add_argument(
-        '--check_pixel_stats', 
-        action='store_true', 
-        help="启用耗时的像素均值和标准差计算。"
-    )
-    parser.add_argument(
-        '--generate_plots', 
-        action='store_true', 
-        help="生成图像尺寸、类别和像素分布图表（需要读取图像文件）。"
-    )
+    parser.add_argument("--check_pixel_stats", action="store_true")
+    parser.add_argument("--generate_plots", action="store_true")
+
+    parser.add_argument("--csv_dir", type=str, default="list_hq")
+    parser.add_argument("--mode", type=str, choices=["folder", "list"], default="folder")
+    parser.add_argument("--csv_list", nargs="*", default=None)
+
     args = parser.parse_args()
-    
+
+    # -------------------- 动态解析文件 --------------------
+    csv_files = resolve_csv_files(args)
+
+    # 更新全局 CSV_DIR及相关路径依赖
+    CSV_DIR = str(Path(OCEC_DATA_ROOT) / args.csv_dir)
+    CSV_BASE_DIR = args.csv_dir
+
+    # 更新报告路径
+    REPORT_DIR = Path(OCEC_LOG_DIR) / "dataset" / CSV_BASE_DIR
+    REPORT_PATH = REPORT_DIR / f"dataset_stats_report_{CSV_BASE_DIR}.txt"
+
+    print('===================REPORT PATH ===================')
+    print('===================', REPORT_PATH, '===================')    
+
     read_images = args.check_pixel_stats or args.generate_plots
-    
-    heights, widths, class_counts, pixels = analyze_dataset(CSV_FILENAMES, read_images, args.generate_plots)
+
+    heights, widths, class_counts, pixels = analyze_dataset(csv_files, read_images, args.generate_plots)
     
     if args.generate_plots:
         plot_results = []

@@ -4,8 +4,8 @@
 # 例如：runs/ocec_hq/v1, runs/ocec_hq/v2 等
 
 export OCEC_ARGS="train \
-    --data_root /ssddisk/guochuang/ocec/parquet_6Whq+24WPublic/ \
-    --output_dir runs/ocec_6Whq+24WPublic \
+    --data_root /ssddisk/guochuang/ocec/parquet_hq/ \
+    --output_dir runs/ocec_hq \
     --epochs 1000 \
     --batch_size 1024 \
     --num_workers 16 \
@@ -20,7 +20,6 @@ export OCEC_ARGS="train \
     --device auto \
     --warmup_epochs 15 \
     --use_amp"
-    # --resume runs/ocec_hq/v1/ocec_best_epoch0017_f1_0.6937.pt"
 
 # 如果需要加载预训练权重，取消下面的注释并指定checkpoint路径
 # --pretrain runs/ocec_hq/v1/checkpoint_best.pt \

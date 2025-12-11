@@ -281,6 +281,18 @@ def detect_hard_samples(probs, labels, margin_th=0.15):
     hard_idx = np.where(margin < margin_th)[0]
     return [(int(i), float(probs[i]), int(labels[i])) for i in hard_idx]
 
+def detect_hard_negatives(probs, labels, min_prob=0.7):
+    """
+    检测 hard negative samples (false positives): pred=1, label=0, prob >= min_prob
+    用于 hard negative mining，提升 precision
+    """
+    probs = np.array(probs)
+    labels = np.array(labels)
+    # False positive: 预测为正类(prob >= 0.5)，但实际是负类(label=0)，且置信度高
+    fp_mask = (probs >= min_prob) & (labels == 0)
+    fp_indices = np.where(fp_mask)[0]
+    return [(int(i), float(probs[i]), int(labels[i])) for i in fp_indices]
+
 def detect_mislabeled(probs, labels, emb, threshold=0.15):
     # 思路：高置信度预测与标签冲突 + embedding 位置偏离
     import numpy as np
@@ -677,7 +689,7 @@ else:
 
 
 class RandomCLAHE:
-    def __init__(self, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8), p: float = 0.01) -> None:
+    def __init__(self, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8), p: float = 0.25) -> None:
         self.clip_limit = float(clip_limit)
         self.tile_grid_size = tile_grid_size
         self.p = float(p)
@@ -841,9 +853,17 @@ class TrainConfig:
     slice_medium_threshold: float = 0.60
     slice_stage_epochs: tuple = (85, 95)
     slice_hard_ratio: float = 0.20
-    enable_pseudo_label: bool = True
+    enable_pseudo_label: bool = False  # 默认禁用，避免干扰实验对比
     pseudo_conf_threshold: float = 0.35
     pseudo_update_start_epoch: int = 25
+    enable_hard_negative_mining: bool = True  # 启用 hard negative mining
+    hard_neg_min_prob: float = 0.7  # hard negative 的最小概率阈值
+    hard_neg_weight: float = 2.0  # hard negative 的采样权重倍数（暂未使用，未来可用于过采样）
+    unfreeze_backbone_ratio: float = 0.5  # Stage2 解冻 backbone 的比例（0.5 = 解冻最后一半）
+    unfreeze_backbone_epoch_stage3: Optional[int] = None  # Stage3 解冻 epoch（通常设为 1000+）
+    unfreeze_backbone_ratio_stage3: float = 0.25  # Stage3 解冻比例（解冻最后 1-2 个 stage，约 25%）
+    stage3_lr: Optional[float] = None  # Stage3 学习率（默认 stage2_lr * 0.5）
+    neg_class_weight: float = 1.2  # 负类在 loss 中的权重（提升 precision）
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1038,6 +1058,10 @@ def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[floa
 
         K.RandomBrightness(brightness=0.25, p=0.35),
         K.RandomContrast(contrast=0.25, p=0.35),
+        # Gamma 校正：增强光照随机性
+        K.RandomGamma(gamma=(0.8, 1.2), gain=(0.9, 1.1), p=0.30),
+        # Exposure 扰动：通过调整亮度范围模拟曝光变化
+        K.RandomBrightness(brightness=0.15, p=0.25),  # 额外的亮度扰动
 
         # Kornia 0.8.2 JPEG API
         K.RandomJPEG(jpeg_quality=(50, 90), p=0.20),
@@ -1069,10 +1093,11 @@ def _freeze_backbone(model: nn.Module) -> None:
     LOGGER.info(f"Frozen {frozen_count} backbone parameters, {trainable_count} head parameters remain trainable")
 
 
-def _unfreeze_backbone_last_layers(model: nn.Module, num_layers: int = 2) -> None:
+def _unfreeze_backbone_last_layers(model: nn.Module, num_layers: int = 2, ratio: float = None) -> None:
     """
-    解冻backbone的最后N层（features的最后N个block）
+    解冻backbone的最后N层（features的最后N个block）或按比例解冻
     num_layers: 解冻的层数（默认2层）
+    ratio: 解冻的比例（0.0-1.0），如果提供则优先使用比例而非固定层数
     """
     # 处理DataParallel包装的模型
     base_model = model.module if hasattr(model, 'module') else model
@@ -1089,6 +1114,12 @@ def _unfreeze_backbone_last_layers(model: nn.Module, num_layers: int = 2) -> Non
     
     # 获取features中的block数量
     num_blocks = len(features_module)
+    
+    # 如果提供了比例，按比例计算层数
+    if ratio is not None and 0.0 < ratio <= 1.0:
+        num_layers = max(1, int(num_blocks * ratio))
+        LOGGER.info(f"Unfreezing {ratio:.1%} of backbone ({num_layers}/{num_blocks} blocks)")
+    else:
     if num_layers > num_blocks:
         LOGGER.warning(f"Requested {num_layers} layers but only {num_blocks} blocks available, unfreezing all blocks")
         num_layers = num_blocks
@@ -1168,6 +1199,7 @@ def _run_epoch(
     slice_medium_threshold: float = 0.60, 
     slice_hard_ratio: float = 0.20,
     pseudo_start_epoch: int = 10,
+    neg_class_weight: float = 1.2  # 负类权重，用于提升 precision
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     all_embeddings = []
     if dataloader is None or len(dataloader.dataset) == 0:
@@ -1259,7 +1291,7 @@ def _run_epoch(
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
-
+        
         with _autocast(autocast_enabled):
             # ---- Forward ----
             forward_out = model(images, labels=labels, return_embedding=True, training=train_mode, epoch=epoch)
@@ -1267,20 +1299,20 @@ def _run_epoch(
             logits, embedding = forward_out
 
             # ---- Unified probability calculation (ALWAYS from margin_head if enabled) ----
-            with torch.no_grad():
+                    with torch.no_grad():
                 if hasattr(model, "module"):
-                    margin_head = model.module.margin_head
-                else:
-                    margin_head = model.margin_head
-
+                            margin_head = model.module.margin_head
+                        else:
+                            margin_head = model.margin_head
+                        
                 if margin_method in ["arcface", "cosface"] and margin_head is not None:
                     clean_logits = margin_head(embedding, labels=None)
                     probs = torch.softmax(clean_logits, dim=1)[:, 1]
-                else:
+                        else:
                     # fallback to BCE-style or raw logits if no margin_head active
-                    if logits.ndim == 2 and logits.size(1) == 2:
-                        probs = torch.softmax(logits, dim=1)[:, 1]
-                    else:
+                            if logits.ndim == 2 and logits.size(1) == 2:
+                                probs = torch.softmax(logits, dim=1)[:, 1]
+                            else:
                         probs = torch.sigmoid(logits.squeeze())
 
             # ---- Pseudo label update ----
@@ -1291,13 +1323,15 @@ def _run_epoch(
                 # assign soft label but only where uncertain
                 pseudo_labels[uncertain_mask] = probs[uncertain_mask].to(pseudo_labels.dtype)
                 used_labels = pseudo_labels   # mixed (hard + soft)
-            else:
+                else:
                 used_labels = labels.float()  # consistent dtype later
 
             # ---- Loss scheduling ----
             if epoch < 15:
                 # Warmup: smooth CE (hard labels only)
-                ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+                # 给负类更大权重以提升 precision
+                class_weights = torch.tensor([neg_class_weight, 1.0], device=labels.device, dtype=torch.float32)
+                ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
                 # ensure logits shape is [B,2]
                 if logits.ndim == 1:
                     logits = logits.unsqueeze(1)
@@ -1306,7 +1340,7 @@ def _run_epoch(
                     logits = torch.cat([-logits, logits], dim=1)  # binary -> 2 class
                 if used_labels.dtype == torch.long:
                     loss = ce_loss_fn(logits, used_labels)
-                else:
+                        else:
                     log_prob = torch.log_softmax(logits, dim=1)
                     soft_target = torch.stack([1 - used_labels, used_labels], dim=1)
                     loss = -(soft_target * log_prob).sum(dim=1).mean()
@@ -1317,7 +1351,9 @@ def _run_epoch(
                 neg_ratio = 1.0 - pos_ratio
                 alpha_dyn = neg_ratio  # alpha = neg / total
                 focal_loss_fn = FocalLoss(gamma=1.0, alpha=alpha_dyn, reduction="mean")
-                ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+                # 给负类更大权重以提升 precision
+                class_weights = torch.tensor([neg_class_weight, 1.0], device=labels.device, dtype=torch.float32)
+                ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
 
                 hybrid_ratio = (epoch - 15) / 15  # linearly 0→1
 
@@ -1342,7 +1378,7 @@ def _run_epoch(
                 # total
                 loss = (1 - hybrid_ratio) * ce_hard + 0.5 * hybrid_ratio * ce_soft + 0.5 * hybrid_ratio * focal_soft
 
-            else:
+                        else:
                 # Full adaptive focal w/ soft labels
                 pos_ratio = labels.float().mean().item()
                 neg_ratio = 1.0 - pos_ratio
@@ -1351,9 +1387,9 @@ def _run_epoch(
                 loss = focal_loss_fn(logits, used_labels)
 
             # ---- Logging values for visualization ----
-            logits_for_debug = logits
+                logits_for_debug = logits
             confidence = probs.clone().detach().cpu()
-
+        
         if train_mode:
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1364,8 +1400,8 @@ def _run_epoch(
                 optimizer.step()
             # 仅在训练阶段且提供了 EMA 对象时更新 EMA 权重
             if ema is not None:
-                    ema.update(model)
-
+                ema.update(model)
+             
         batch_size = labels.size(0)
         stats["loss"] += loss.detach().item() * batch_size
         stats["samples"] += batch_size
@@ -1759,6 +1795,17 @@ def log_all_separation_metrics(split, outputs, epoch, tb_writer, config):
         for i,p,l in hard:
             f.write(f"{i},{p},{l}\n")
     LOGGER.info(f"[{split}] Hard samples computation completed")
+    
+    # 4.5) Hard Negative Mining: 检测 false positives（用于提升 precision）
+    if split == "val" and getattr(config, 'enable_hard_negative_mining', False):
+        min_prob = getattr(config, 'hard_neg_min_prob', 0.7)
+        hard_negatives = detect_hard_negatives(metrics_probs, metrics_labels, min_prob=min_prob)
+        csv_path = os.path.join(config.output_dir, "hard_negatives.csv")
+        with open(csv_path, "w") as f:
+            f.write("index,prob,label\n")
+            for i,p,l in hard_negatives:
+                f.write(f"{i},{p},{l}\n")
+        LOGGER.info(f"[{split}] Hard negatives (FP) detected: {len(hard_negatives)} samples (prob >= {min_prob})")
 
     # 5) 错标检测（使用采样后的数据）
     LOGGER.info(f"[{split}] Computing mislabeled samples...")
@@ -2093,12 +2140,43 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     val_dataset = OCECDataset(splits["val"], transform=eval_transform, confidence_dict=None) if splits["val"] else None
     test_dataset = OCECDataset(splits["test"], transform=eval_transform, confidence_dict=None) if splits["test"] else None
 
-    # train_sampler = build_weighted_sampler(splits["train"])
+    # Hard-Negative Mining: 如果启用了且存在 hard_negatives.csv，构建加权采样器
+    train_sampler = None
+    if getattr(config, 'enable_hard_negative_mining', False):
+        hard_neg_csv = config.output_dir / "hard_negatives.csv"
+        if hard_neg_csv.exists():
+            try:
+                import pandas as pd
+                hard_neg_df = pd.read_csv(hard_neg_csv)
+                hard_neg_indices = set(hard_neg_df['index'].values)
+                hard_neg_weight = getattr(config, 'hard_neg_weight', 2.0)
+                
+                # 构建权重列表：hard negative 样本权重更高
+                weights = []
+                for sample in splits["train"]:
+                    if sample.index in hard_neg_indices:
+                        weights.append(hard_neg_weight)
+                    else:
+                        weights.append(1.0)
+                
+                from torch.utils.data import WeightedRandomSampler
+                train_sampler = WeightedRandomSampler(
+                    weights=weights,
+                    num_samples=len(weights),
+                    replacement=True
+                )
+                LOGGER.info(f"Hard-Negative Mining enabled: {len(hard_neg_indices)} hard negatives with weight {hard_neg_weight}x")
+            except Exception as e:
+                LOGGER.warning(f"Failed to load hard_negatives.csv for weighted sampling: {e}")
+                train_sampler = None
+        else:
+            LOGGER.info("hard_negatives.csv not found, will be generated during first validation")
+    
     train_loader = create_dataloader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
-        sampler=None,
+        shuffle=(train_sampler is None),  # 如果使用 sampler，则不需要 shuffle
+        sampler=train_sampler,
         num_workers=config.num_workers,
     )
     val_loader = (
@@ -2387,8 +2465,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             # 检查第一阶段效果（如果验证集F1达到目标，才解冻）
             if val_metrics is not None and val_metrics.get("f1", 0) >= 0.80:
                 LOGGER.info(f"Epoch {epoch}: Stage 1 F1={val_metrics['f1']:.4f} >= 0.80, proceeding to Stage 2")
-                LOGGER.info(f"Epoch {epoch}: Unfreezing last 2 layers of backbone for progressive fine-tuning")
-                _unfreeze_backbone_last_layers(model, num_layers=2)
+                # 使用配置的解冻比例（默认 0.5 = 解冻最后一半）
+                unfreeze_ratio = getattr(config, 'unfreeze_backbone_ratio', 0.5)
+                LOGGER.info(f"Epoch {epoch}: Unfreezing {unfreeze_ratio:.1%} of backbone for progressive fine-tuning")
+                _unfreeze_backbone_last_layers(model, num_layers=2, ratio=unfreeze_ratio)
                 # 重新创建优化器，包含新解冻的参数，使用更小的学习率
                 if config.stage2_lr is not None:
                     stage2_lr = config.stage2_lr
@@ -2415,6 +2495,45 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 else:
                     LOGGER.warning(f"Epoch {epoch}: No validation metrics available, skipping Stage 2 unfreezing")
         
+        # Stage 3: 进一步解冻最后 1-2 个 stage（通常在 1000+ epoch 后）
+        if config.unfreeze_backbone_epoch_stage3 is not None and epoch >= config.unfreeze_backbone_epoch_stage3:
+            # 检查是否已经解冻过（Stage 2 已执行）
+            # 如果 Stage 2 未执行，跳过 Stage 3
+            if config.unfreeze_backbone_epoch is not None and epoch >= config.unfreeze_backbone_epoch:
+                if val_metrics is not None and val_metrics.get("f1", 0) >= 0.85:
+                    LOGGER.info(f"Epoch {epoch}: Stage 2 F1={val_metrics['f1']:.4f} >= 0.85, proceeding to Stage 3")
+                    # 使用配置的 Stage3 解冻比例（默认 0.25 = 解冻最后 1-2 个 stage）
+                    unfreeze_ratio_stage3 = getattr(config, 'unfreeze_backbone_ratio_stage3', 0.25)
+                    LOGGER.info(f"Epoch {epoch}: Unfreezing additional {unfreeze_ratio_stage3:.1%} of backbone for Stage 3 fine-tuning")
+                    _unfreeze_backbone_last_layers(model, num_layers=1, ratio=unfreeze_ratio_stage3)
+                    # 重新创建优化器，使用更小的学习率
+                    if config.stage3_lr is not None:
+                        stage3_lr = config.stage3_lr
+                    elif config.stage2_lr is not None:
+                        stage3_lr = config.stage2_lr * 0.5  # 默认使用 Stage2 学习率的 50%
+                    else:
+                        stage3_lr = config.lr * 0.025  # 如果 Stage2 未设置，使用原始学习率的 2.5%
+                    optimizer = torch.optim.AdamW(
+                        (param for param in model.parameters() if param.requires_grad),
+                        lr=stage3_lr,
+                        weight_decay=config.weight_decay,
+                    )
+                    LOGGER.info(f"Recreated optimizer with Stage 3 LR: {stage3_lr:.6f}")
+                    # 重新创建学习率调度器
+                    main_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer, mode="min", factor=0.5, patience=2
+                    )
+                    if warmup_epochs > 0:
+                        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+                        scheduler = {"type": "warmup", "warmup": warmup_scheduler, "main": main_scheduler, "warmup_epochs": warmup_epochs}
+                    else:
+                        scheduler = {"type": "main", "main": main_scheduler, "warmup_epochs": 0}
+                    # 标记已执行，避免重复执行
+                    config.unfreeze_backbone_epoch_stage3 = None
+                else:
+                    if val_metrics is not None:
+                        LOGGER.warning(f"Epoch {epoch}: Stage 2 F1={val_metrics['f1']:.4f} < 0.85, skipping Stage 3 unfreezing")
+        
         train_metrics, train_outputs = _run_epoch(
             model,
             train_loader,
@@ -2429,6 +2548,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             ema=ema,  # 训练阶段更新 EMA
             epoch=epoch,
             pseudo_start_epoch=config.pseudo_update_start_epoch,
+            neg_class_weight=getattr(config, 'neg_class_weight', 1.2),
         )
 
         # ---- Hard sample stats (only if slice enabled & outputs available) ----
@@ -2570,6 +2690,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 margin_method=config.margin_method,
                 ema=None,  # 验证阶段不再更新 EMA，只使用 apply() 后的权重
                 epoch=epoch,
+                neg_class_weight=getattr(config, 'neg_class_weight', 1.2),
             )
             
             if (config.enable_pseudo_label and epoch >= config.pseudo_update_start_epoch and train_outputs is not None):
@@ -3421,6 +3542,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of epochs for linear learning rate warmup (default: 5, set to 0 to disable).",
     )
     train_parser.add_argument("--pseudo_update_start_epoch", type=int, default=25, help="Delay pseudo-labeling until this epoch.")
+    train_parser.add_argument("--neg_class_weight", type=float, default=1.2, help="Weight for negative class in loss (default: 1.2, higher = more focus on precision).")
+    train_parser.add_argument("--unfreeze_backbone_ratio", type=float, default=0.5, help="Ratio of backbone to unfreeze in Stage2 (default: 0.5 = last half).")
+    train_parser.add_argument("--enable_hard_negative_mining", action="store_true", help="Enable hard negative mining (detect and log false positives).")
+    train_parser.add_argument("--hard_neg_min_prob", type=float, default=0.7, help="Minimum probability threshold for hard negatives (default: 0.7).")
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -3523,6 +3648,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             unfreeze_backbone_epoch=args.unfreeze_backbone_epoch,
             stage2_lr=args.stage2_lr,
             pseudo_update_start_epoch=args.pseudo_update_start_epoch,
+            neg_class_weight=getattr(args, 'neg_class_weight', 1.2),
+            unfreeze_backbone_ratio=getattr(args, 'unfreeze_backbone_ratio', 0.5),
+            enable_hard_negative_mining=getattr(args, 'enable_hard_negative_mining', False),
+            hard_neg_min_prob=getattr(args, 'hard_neg_min_prob', 0.7),
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

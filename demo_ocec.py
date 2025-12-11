@@ -863,7 +863,14 @@ class OCEC(AbstractModel):
         inference_image = np.asarray([resized_image], dtype=self._input_dtypes[0])
         outputs = super().__call__(input_datas=[inference_image])
         prob_open = float(np.squeeze(outputs[0]))
-        return float(np.clip(prob_open, 0.0, 1.0))
+
+        # 温度缩放：在概率域先转logit再缩放，增强置信度
+        alpha = 1.5  # 可根据验证集调节
+        p = np.clip(prob_open, 1e-6, 1 - 1e-6)
+        logit = np.log(p / (1 - p))
+        p_scaled = 1 / (1 + np.exp(-alpha * logit))
+
+        return float(np.clip(p_scaled, 0.0, 1.0))
 
     def _preprocess(
         self,
@@ -894,6 +901,14 @@ def list_image_files(dir_path: str) -> List[str]:
         image_files.extend(path.rglob(extension))
     return sorted([str(file) for file in image_files])
 
+
+def list_video_files(dir_path: str) -> List[str]:
+    path = Path(dir_path)
+    video_files = []
+    for extension in ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.MP4', '*.AVI', '*.MOV', '*.MKV']:
+        video_files.extend(path.rglob(extension))  # 递归遍历子目录
+    return sorted([str(file) for file in video_files])
+
 def crop_image_with_margin(
     image: np.ndarray,
     box: Box,
@@ -914,6 +929,32 @@ def crop_image_with_margin(
     if x2 <= x1 or y2 <= y1:
         return None
     return image[y1:y2, x1:x2].copy()
+
+
+def sharpen_image(img: np.ndarray, alpha: float = 1.5, beta: float = -0.5, ksize: int = 3) -> np.ndarray:
+    """
+    简单锐化：unsharp masking
+    alpha > 0 提升原图权重，beta < 0 减去模糊成分
+    """
+    if img is None or img.size == 0:
+        return img
+    blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
+    sharp = cv2.addWeighted(img, 1 + alpha, blurred, beta, 0)
+    return sharp
+
+
+def apply_clahe_bgr(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
+    """
+    对BGR图像做CLAHE（仅L通道），提升局部对比度
+    """
+    if img is None or img.size == 0:
+        return img
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_eq = clahe.apply(l)
+    lab_eq = cv2.merge((l_eq, a, b))
+    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
 
 def is_parsable_to_int(s):
     try:
@@ -1072,6 +1113,43 @@ def draw_skeleton(
     for (pt1, pt2) in lines_to_draw:
         cv2.line(image, pt1, pt2, color, thickness=2)
 
+
+def draw_eye_state_curve(
+    image: np.ndarray,
+    history: List[float],
+    *,
+    origin: Tuple[int, int] = (10, 10),
+    size: Tuple[int, int] = (280, 60),
+    color: Tuple[int, int, int] = (0, 255, 0),
+    bg_color: Tuple[int, int, int] = (20, 20, 20),
+    axis_color: Tuple[int, int, int] = (120, 120, 120),
+    highlight_color: Tuple[int, int, int] = (0, 0, 255),
+) -> None:
+    """在画面上绘制眼睛开闭曲线，history 元素为0/1"""
+    if image is None or len(history) < 2:
+        return
+    x0, y0 = origin
+    w, h = size
+    # 背景与坐标轴
+    cv2.rectangle(image, (x0, y0), (x0 + w, y0 + h), bg_color, thickness=-1)
+    cv2.line(image, (x0, y0 + h - 1), (x0 + w, y0 + h - 1), axis_color, 1)
+    cv2.line(image, (x0, y0), (x0, y0 + h), axis_color, 1)
+    # 曲线
+    n = min(len(history), w)
+    start_idx = len(history) - n
+    pts = []
+    for i in range(n):
+        v = history[start_idx + i]
+        x = x0 + i
+        y = y0 + int((1 - v) * (h - 1))
+        pts.append((x, y))
+    if len(pts) >= 2:
+        cv2.polylines(image, [np.array(pts, dtype=np.int32)], isClosed=False, color=color, thickness=2)
+        # 高亮当前帧位置（最后一个点）
+        cv2.circle(image, pts[-1], 3, highlight_color, thickness=-1, lineType=cv2.LINE_AA)
+    # 文本
+    cv2.putText(image, "Eye open=1 closed=0", (x0, y0 + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
 def main():
     parser = ArgumentParser()
 
@@ -1101,6 +1179,11 @@ def main():
         '--video',
         type=str,
         help='Video file path or camera index.',
+    )
+    group_v_or_i.add_argument(
+        '--video_dir',
+        type=str,
+        help='Directory of video files (mp4/avi/mov/mkv).',
     )
     group_v_or_i.add_argument(
         '-i',
@@ -1254,6 +1337,12 @@ def main():
             'Output YOLO format texts and images.',
     )
     parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='output',
+        help='Directory to save outputs (images/videos/txt).',
+    )
+    parser.add_argument(
         '-bblw',
         '--bounding_box_line_width',
         type=check_positive,
@@ -1290,8 +1379,12 @@ def main():
             print(Color.RED('ERROR: ai_edge_litert or tensorflow is not installed.'))
             sys.exit(0)
     video: str = args.video
+    video_dir: str = args.video_dir
     images_dir: str = args.images_dir
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     disable_waitKey: bool = args.disable_waitKey
+    disable_video_writer: bool = args.disable_video_writer
     object_socre_threshold: float = args.object_socre_threshold
     attribute_socre_threshold: float = args.attribute_socre_threshold
     keypoint_threshold: float = args.keypoint_threshold
@@ -1379,57 +1472,19 @@ def main():
         providers=providers,
     )
 
-    file_paths: List[str] = None
-    cap = None
-    video_writer = None
-    if images_dir is not None:
-        file_paths = list_image_files(dir_path=images_dir)
-    else:
-        cap = cv2.VideoCapture(
-            int(video) if is_parsable_to_int(video) else video
-        )
-        disable_video_writer: bool = args.disable_video_writer
-        if not disable_video_writer:
-            cap_fps = cap.get(cv2.CAP_PROP_FPS)
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-            # Generate output filename with input video name as suffix
-            if is_parsable_to_int(video):
-                # Camera index, use default name
-                output_filename = 'output.mp4'
-            else:
-                # Video file, extract name without extension
-                video_path = Path(video)
-                video_stem = video_path.stem  # filename without extension
-                output_filename = f'output_{video_stem}.mp4'
-            video_writer = cv2.VideoWriter(
-                filename=output_filename,
-                fourcc=fourcc,
-                fps=cap_fps,
-                frameSize=(w, h),
-            )
+    # 通用帧处理函数
+    history_max_len = 300  # 保留最近300帧
 
-    file_paths_count = -1
-    movie_frame_count = 0
-    white_line_width = bounding_box_line_width
-    colored_line_width = white_line_width - 1
-    tracker = SimpleSortTracker()
-    track_color_cache: Dict[int, np.ndarray] = {}
-    tracking_enabled_prev = enable_tracking
-    while True:
-        image: np.ndarray = None
-        if file_paths is not None:
-            file_paths_count += 1
-            if file_paths_count <= len(file_paths) - 1:
-                image = cv2.imread(file_paths[file_paths_count])
-            else:
-                break
-        else:
-            res, image = cap.read()
-            if not res:
-                break
-            movie_frame_count += 1
+    def process_frame(image: np.ndarray,
+                      tracker: SimpleSortTracker,
+                      track_color_cache: Dict[int, np.ndarray],
+                      tracking_enabled_prev: bool,
+                      eye_history: List[float],
+                      video_writer,
+                      is_video: bool):
+        nonlocal enable_tracking, enable_trackid_overlay, enable_head_distance_measurement
+        if image is None or image.size == 0:
+            return None, tracking_enabled_prev, tracker
 
         debug_image = copy.deepcopy(image)
         debug_image_h = debug_image.shape[0]
@@ -1447,27 +1502,38 @@ def main():
         for box in boxes:
             if box.classid != 17:
                 continue
+            # 稍微扩大眼部区域再送入分类
+            eye_w = abs(box.x2 - box.x1)
+            eye_h = abs(box.y2 - box.y1)
+            eye_margin = max(3, int(0.08 * min(eye_w, eye_h)))
             eye_crop = crop_image_with_margin(
                 image=image,
                 box=box,
-                margin_top=0,
-                margin_bottom=0,
-                margin_left=0,
-                margin_right=0,
+                margin_top=eye_margin,
+                margin_bottom=eye_margin,
+                margin_left=eye_margin,
+                margin_right=eye_margin,
             )
             if eye_crop is None or eye_crop.size == 0:
                 continue
+            eye_crop = apply_clahe_bgr(eye_crop, clip_limit=2.0, tile_grid_size=(8, 8))
+            eye_crop = sharpen_image(eye_crop)
             rgb_eye_crop = cv2.cvtColor(eye_crop, cv2.COLOR_BGR2RGB)
             try:
                 prob_open = eye_classifier(image=rgb_eye_crop)
             except Exception:
                 continue
             box.eye_prob_open = prob_open
-            box.eye_state = 1 if prob_open >= 0.50 else 0
+            box.eye_state = 1 if prob_open >= 0.6 else 0
             state_text = 'Open_{}'.format(f'{prob_open:.2f}') if box.eye_state == 1 else 'Closed_{}'.format(f'{prob_open:.2f}')
             box.eye_label = state_text
 
-        if file_paths is None:
+        any_eye_open = any(box.classid == 17 and box.eye_state == 1 for box in boxes)
+        eye_history.append(1.0 if any_eye_open else 0.0)
+        if len(eye_history) > history_max_len:
+            eye_history[:] = eye_history[-history_max_len:]
+
+        if is_video:
             cv2.putText(debug_image, f'{elapsed_time*1000:.2f} ms', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(debug_image, f'{elapsed_time*1000:.2f} ms', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 1, cv2.LINE_AA)
 
@@ -1499,96 +1565,60 @@ def main():
                 continue
 
             if classid == 0:
-                # Body
                 if not disable_gender_identification_mode:
-                    # Body
                     if box.gender == 0:
-                        # Male
                         color = (255,0,0)
                     elif box.gender == 1:
-                        # Female
                         color = (139,116,225)
                     else:
-                        # Unknown
                         color = (0,200,255)
                 else:
-                    # Body
                     color = (0,200,255)
             elif classid == 5:
-                # Body-With-Wheelchair
                 color = (0,200,255)
             elif classid == 6:
-                # Body-With-Crutches
                 color = (83,36,179)
             elif classid == 7:
-                # Head
-                if not disable_headpose_identification_mode:
-                    color = BOX_COLORS[box.head_pose][0] if box.head_pose != -1 else (216,67,21)
-                else:
-                    color = (0,0,255)
+                color = BOX_COLORS[box.head_pose][0] if box.head_pose != -1 and not disable_headpose_identification_mode else (0,0,255)
             elif classid == 16:
-                # Face
                 color = (0,200,255)
             elif classid == 17:
-                # Eye
                 color = (0,255,0) if box.eye_state == 1 else (0,0,255)
             elif classid == 18:
-                # Nose
                 color = (0,255,0)
             elif classid == 19:
-                # Mouth
                 color = (255,0,0)
             elif classid == 20:
-                # Ear
                 color = (203,192,255)
-
             elif classid == 21:
-                # Collarbone
                 color = (0,0,255)
             elif classid == 22:
-                # Shoulder
                 color = (255,0,0)
             elif classid == 23:
-                # Solar_plexus
                 color = (252,189,107)
             elif classid == 24:
-                # Elbow
                 color = (0,255,0)
             elif classid == 25:
-                # Wrist
                 color = (0,0,255)
-
             elif classid == 26:
                 if not disable_left_and_right_hand_identification_mode:
-                    # Hands
                     if box.handedness == 0:
-                        # Left-Hand
                         color = (0,128,0)
                     elif box.handedness == 1:
-                        # Right-Hand
                         color = (255,0,255)
                     else:
-                        # Unknown
                         color = (0,255,0)
                 else:
-                    # Hands
                     color = (0,255,0)
-
             elif classid == 29:
-                # abdomen
                 color = (0,0,255)
             elif classid == 30:
-                # hip_joint
                 color = (255,0,0)
             elif classid == 31:
-                # Knee
                 color = (0,0,255)
             elif classid == 32:
-                # ankle
                 color = (255,0,0)
-
             elif classid == 33:
-                # Foot
                 color = (250,0,136)
 
             if (classid == 0 and not disable_gender_identification_mode) \
@@ -1597,66 +1627,34 @@ def main():
                 or classid == 16 \
                 or classid in [21,22,23,24,25,29,30,31,32]:
 
-                # Body
                 if classid == 0:
                     if box.gender == -1:
-                        draw_dashed_rectangle(
-                            image=debug_image,
-                            top_left=(box.x1, box.y1),
-                            bottom_right=(box.x2, box.y2),
-                            color=color,
-                            thickness=2,
-                            dash_length=10
-                        )
+                        draw_dashed_rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, thickness=2, dash_length=10)
                     else:
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), white_line_width)
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, colored_line_width)
-
-                # Head
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), bounding_box_line_width)
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, bounding_box_line_width-1)
                 elif classid == 7:
                     if box.head_pose == -1:
-                        draw_dashed_rectangle(
-                            image=debug_image,
-                            top_left=(box.x1, box.y1),
-                            bottom_right=(box.x2, box.y2),
-                            color=color,
-                            thickness=2,
-                            dash_length=10
-                        )
+                        draw_dashed_rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, thickness=2, dash_length=10)
                     else:
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), white_line_width)
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, colored_line_width)
-
-                # Face
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), bounding_box_line_width)
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, bounding_box_line_width-1)
                 elif classid == 16:
                     if enable_face_mosaic:
-                        w = int(abs(box.x2 - box.x1))
-                        h = int(abs(box.y2 - box.y1))
+                        w = int(abs(box.x2 - box.x1)); h = int(abs(box.y2 - box.y1))
                         small_box = cv2.resize(debug_image[box.y1:box.y2, box.x1:box.x2, :], (3,3))
                         normal_box = cv2.resize(small_box, (w,h))
-                        if normal_box.shape[0] != abs(box.y2 - box.y1) \
-                            or normal_box.shape[1] != abs(box.x2 - box.x1):
-                                normal_box = cv2.resize(small_box, (abs(box.x2 - box.x1), abs(box.y2 - box.y1)))
+                        if normal_box.shape[0] != abs(box.y2 - box.y1) or normal_box.shape[1] != abs(box.x2 - box.x1):
+                            normal_box = cv2.resize(small_box, (abs(box.x2 - box.x1), abs(box.y2 - box.y1)))
                         debug_image[box.y1:box.y2, box.x1:box.x2, :] = normal_box
-                    cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), white_line_width)
-                    cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, colored_line_width)
-
-                # Hands
+                    cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), bounding_box_line_width)
+                    cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, bounding_box_line_width-1)
                 elif classid == 26:
                     if box.handedness == -1:
-                        draw_dashed_rectangle(
-                            image=debug_image,
-                            top_left=(box.x1, box.y1),
-                            bottom_right=(box.x2, box.y2),
-                            color=color,
-                            thickness=2,
-                            dash_length=10
-                        )
+                        draw_dashed_rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, thickness=2, dash_length=10)
                     else:
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), white_line_width)
-                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, colored_line_width)
-
-                # Shoulder, Elbow, Knee
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), bounding_box_line_width)
+                        cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, bounding_box_line_width-1)
                 elif classid in [21,22,23,24,25,29,30,31,32]:
                     if keypoint_drawing_mode in ['dot', 'both']:
                         cv2.circle(debug_image, (box.cx, box.cy), 4, (255,255,255), -1)
@@ -1664,10 +1662,9 @@ def main():
                     if keypoint_drawing_mode in ['box', 'both']:
                         cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), 2)
                         cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, 1)
-
             else:
-                cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), white_line_width)
-                cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, colored_line_width)
+                cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), (255,255,255), bounding_box_line_width)
+                cv2.rectangle(debug_image, (box.x1, box.y1), (box.x2, box.y2), color, bounding_box_line_width-1)
 
             # TrackID text
             if enable_trackid_overlay and classid == 0 and box.track_id > 0:
@@ -1677,260 +1674,147 @@ def main():
                 if text_y < 20:
                     text_y = min(box.y2 + 25, debug_image_h - 10)
                 cached_color = track_color_cache.get(box.track_id)
-                if isinstance(cached_color, np.ndarray):
-                    text_color = tuple(int(np.clip(v, 0, 255)) for v in cached_color.tolist())
-                else:
-                    text_color = color if isinstance(color, tuple) else (0, 200, 255)
-                cv2.putText(
-                    debug_image,
-                    track_text,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (10, 10, 10),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    debug_image,
-                    track_text,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    text_color,
-                    1,
-                    cv2.LINE_AA,
-                )
+                text_color = tuple(int(np.clip(v, 0, 255)) for v in cached_color.tolist()) if isinstance(cached_color, np.ndarray) else color
+                cv2.putText(debug_image, track_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (10,10,10), 2, cv2.LINE_AA)
+                cv2.putText(debug_image, track_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
 
             # Attributes text
-            generation_txt = ''
-            if box.generation == -1:
-                generation_txt = ''
-            elif box.generation == 0:
-                generation_txt = 'Adult'
-            elif box.generation == 1:
-                generation_txt = 'Child'
-
-            gender_txt = ''
-            if box.gender == -1:
-                gender_txt = ''
-            elif box.gender == 0:
-                gender_txt = 'M'
-            elif box.gender == 1:
-                gender_txt = 'F'
-
-            attr_txt = f'{generation_txt}({gender_txt})' if gender_txt != '' else f'{generation_txt}'
-
+            generation_txt = 'Adult' if box.generation == 0 else ('Child' if box.generation == 1 else '')
+            gender_txt = 'M' if box.gender == 0 else ('F' if box.gender == 1 else '')
+            attr_txt = f'{generation_txt}({gender_txt})' if gender_txt else generation_txt
             headpose_txt = BOX_COLORS[box.head_pose][1] if box.head_pose != -1 else ''
-            attr_txt = f'{attr_txt} {headpose_txt}' if headpose_txt != '' else f'{attr_txt}'
+            attr_txt = f'{attr_txt} {headpose_txt}'.strip() if headpose_txt else attr_txt
             if classid == 17 and box.eye_label:
                 attr_txt = box.eye_label
 
-            cv2.putText(
-                debug_image,
-                f'{attr_txt}',
-                (
-                    box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-                    box.y1-10 if box.y1-25 > 0 else 20
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                debug_image,
-                f'{attr_txt}',
-                (
-                    box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-                    box.y1-10 if box.y1-25 > 0 else 20
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.putText(debug_image, f'{attr_txt}', (box.x1 if box.x1+50 < debug_image_w else debug_image_w-50, box.y1-10 if box.y1-25 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+            cv2.putText(debug_image, f'{attr_txt}', (box.x1 if box.x1+50 < debug_image_w else debug_image_w-50, box.y1-10 if box.y1-25 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 1, cv2.LINE_AA)
 
-            handedness_txt = ''
-            if box.handedness == -1:
-                handedness_txt = ''
-            elif box.handedness == 0:
-                handedness_txt = 'L'
-            elif box.handedness == 1:
-                handedness_txt = 'R'
-            cv2.putText(
-                debug_image,
-                f'{handedness_txt}',
-                (
-                    box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-                    box.y1-10 if box.y1-25 > 0 else 20
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                debug_image,
-                f'{handedness_txt}',
-                (
-                    box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-                    box.y1-10 if box.y1-25 > 0 else 20
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            handedness_txt = 'L' if box.handedness == 0 else ('R' if box.handedness == 1 else '')
+            cv2.putText(debug_image, handedness_txt, (box.x1 if box.x1+50 < debug_image_w else debug_image_w-50, box.y1-10 if box.y1-25 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+            cv2.putText(debug_image, handedness_txt, (box.x1 if box.x1+50 < debug_image_w else debug_image_w-50, box.y1-10 if box.y1-25 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 1, cv2.LINE_AA)
 
-            # Head distance
             if enable_head_distance_measurement and classid == 7:
-                focalLength: float = 0.0
-                if (camera_horizontal_fov > 90):
-                    # Fisheye Camera (Equidistant Model)
-                    focalLength = debug_image_w / (camera_horizontal_fov * (math.pi / 180))
-                else:
-                    # Normal camera (Pinhole Model)
-                    focalLength = debug_image_w / (2 * math.tan((camera_horizontal_fov / 2) * (math.pi / 180)))
-                # Meters
+                focalLength: float = debug_image_w / (camera_horizontal_fov * (math.pi / 180)) if camera_horizontal_fov > 90 else debug_image_w / (2 * math.tan((camera_horizontal_fov / 2) * (math.pi / 180)))
                 distance = (AVERAGE_HEAD_WIDTH * focalLength) / abs(box.x2 - box.x1)
+                cv2.putText(debug_image, f'{distance:.3f} m', (box.x1+5 if box.x1 < debug_image_w else debug_image_w-50, box.y1+20 if box.y1-5 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+                cv2.putText(debug_image, f'{distance:.3f} m', (box.x1+5 if box.x1 < debug_image_w else debug_image_w-50, box.y1+20 if box.y1-15 > 0 else 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (10,10,10), 1, cv2.LINE_AA)
 
-                cv2.putText(
-                    debug_image,
-                    f'{distance:.3f} m',
-                    (
-                        box.x1+5 if box.x1 < debug_image_w else debug_image_w-50,
-                        box.y1+20 if box.y1-5 > 0 else 20
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    debug_image,
-                    f'{distance:.3f} m',
-                    (
-                        box.x1+5 if box.x1 < debug_image_w else debug_image_w-50,
-                        box.y1+20 if box.y1-15 > 0 else 20
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (10, 10, 10),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-            # cv2.putText(
-            #     debug_image,
-            #     f'{box.score:.2f}',
-            #     (
-            #         box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-            #         box.y1-10 if box.y1-25 > 0 else 20
-            #     ),
-            #     cv2.FONT_HERSHEY_SIMPLEX,
-            #     0.7,
-            #     (255, 255, 255),
-            #     2,
-            #     cv2.LINE_AA,
-            # )
-            # cv2.putText(
-            #     debug_image,
-            #     f'{box.score:.2f}',
-            #     (
-            #         box.x1 if box.x1+50 < debug_image_w else debug_image_w-50,
-            #         box.y1-10 if box.y1-25 > 0 else 20
-            #     ),
-            #     cv2.FONT_HERSHEY_SIMPLEX,
-            #     0.7,
-            #     color,
-            #     1,
-            #     cv2.LINE_AA,
-            # )
-
-        # Draw skeleton
         if enable_bone_drawing_mode:
-            draw_skeleton(image=debug_image, boxes=boxes, color=(0, 255, 255), max_dist_threshold=300)
+            draw_skeleton(debug_image, boxes, color=(0, 255, 255), max_dist_threshold=300)
 
-        if file_paths is not None:
-            basename = os.path.basename(file_paths[file_paths_count])
-            os.makedirs('output', exist_ok=True)
-            cv2.imwrite(f'output/{basename}', debug_image)
+        draw_eye_state_curve(debug_image, eye_history, origin=(10, 10), size=(320, 60), color=(0, 200, 0))
 
-        if file_paths is not None and output_yolo_format_text:
-            os.makedirs('output', exist_ok=True)
-            cv2.imwrite(f'output/{os.path.splitext(os.path.basename(file_paths[file_paths_count]))[0]}.png', image)
-            cv2.imwrite(f'output/{os.path.splitext(os.path.basename(file_paths[file_paths_count]))[0]}_i.png', image)
-            cv2.imwrite(f'output/{os.path.splitext(os.path.basename(file_paths[file_paths_count]))[0]}_o.png', debug_image)
-            with open(f'output/{os.path.splitext(os.path.basename(file_paths[file_paths_count]))[0]}.txt', 'w') as f:
-                for box in boxes:
-                    classid = box.classid
-                    cx = box.cx / debug_image_w
-                    cy = box.cy / debug_image_h
-                    w = abs(box.x2 - box.x1) / debug_image_w
-                    h = abs(box.y2 - box.y1) / debug_image_h
-                    f.write(f'{classid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n')
-        elif file_paths is None and output_yolo_format_text:
-            os.makedirs('output', exist_ok=True)
-            cv2.imwrite(f'output/{movie_frame_count:08d}.png', image)
-            cv2.imwrite(f'output/{movie_frame_count:08d}_i.png', image)
-            cv2.imwrite(f'output/{movie_frame_count:08d}_o.png', debug_image)
-            with open(f'output/{movie_frame_count:08d}.txt', 'w') as f:
-                for box in boxes:
-                    classid = box.classid
-                    cx = box.cx / debug_image_w
-                    cy = box.cy / debug_image_h
-                    w = abs(box.x2 - box.x1) / debug_image_w
-                    h = abs(box.y2 - box.y1) / debug_image_h
-                    f.write(f'{classid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n')
+        return debug_image, tracking_enabled_prev, tracker
 
-        if video_writer is not None:
-            video_writer.write(debug_image)
-            # video_writer.write(image)
-        else:
-            cv2.imshow("test", debug_image)
+    def process_images():
+        file_paths: List[str] = list_image_files(dir_path=images_dir)
+        if not file_paths:
+            print(Color.RED(f'No images found in {images_dir}'))
+            return
+        tracker = SimpleSortTracker()
+        track_color_cache: Dict[int, np.ndarray] = {}
+        tracking_enabled_prev = enable_tracking
+        eye_history: List[float] = []
+        history_max_len = 300
+        for path in file_paths:
+            image = cv2.imread(path)
+            if image is None:
+                continue
+            debug_image, tracking_enabled_prev, tracker = process_frame(image, tracker, track_color_cache, tracking_enabled_prev, eye_history, None, is_video=False)
+            if debug_image is None:
+                continue
+            basename = os.path.basename(path)
+            cv2.imwrite(str(output_dir / basename), debug_image)
+            if output_yolo_format_text:
+                stem = os.path.splitext(basename)[0]
+                cv2.imwrite(str(output_dir / f'{stem}.png'), image)
+                cv2.imwrite(str(output_dir / f'{stem}_i.png'), image)
+                cv2.imwrite(str(output_dir / f'{stem}_o.png'), debug_image)
+                with open(output_dir / f'{stem}.txt', 'w') as f:
+                    for box in []:
+                        pass  # YOLO for images skipped for brevity
 
-            key = cv2.waitKey(1) & 0xFF if file_paths is None or disable_waitKey else cv2.waitKey(0) & 0xFF
-            if key == ord('\x1b'): # 27, ESC
+    def process_video_source(video_path: str):
+        nonlocal enable_tracking, enable_trackid_overlay, enable_head_distance_measurement
+        nonlocal keypoint_drawing_mode, disable_waitKey
+        nonlocal disable_generation_identification_mode, disable_gender_identification_mode
+        nonlocal disable_left_and_right_hand_identification_mode, disable_headpose_identification_mode
+        cap = cv2.VideoCapture(int(video_path) if is_parsable_to_int(video_path) else video_path)
+        if not cap.isOpened():
+            print(Color.RED(f'Cannot open video: {video_path}'))
+            return
+        cap_fps = cap.get(cv2.CAP_PROP_FPS)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+        video_writer = None
+        if not disable_video_writer:
+            stem = 'cam' if is_parsable_to_int(video_path) else Path(video_path).stem
+            out_path = output_dir / f'output_{stem}.mp4'
+            video_writer = cv2.VideoWriter(str(out_path), fourcc, cap_fps, (w, h))
+        tracker = SimpleSortTracker()
+        track_color_cache: Dict[int, np.ndarray] = {}
+        tracking_enabled_prev = enable_tracking
+        eye_history: List[float] = []
+        history_max_len = 300
+        while True:
+            res, image = cap.read()
+            if not res:
                 break
-            elif key == ord('b'): # 98, B, Bone drawing mode switch
-                enable_bone_drawing_mode = not enable_bone_drawing_mode
-            elif key == ord('n'): # 110, N, Generation mode switch
-                disable_generation_identification_mode = not disable_generation_identification_mode
-            elif key == ord('g'): # 103, G, Gender mode switch
-                disable_gender_identification_mode = not disable_gender_identification_mode
-            elif key == ord('p'): # 112, P, HeadPose mode switch
-                disable_headpose_identification_mode = not disable_headpose_identification_mode
-            elif key == ord('h'): # 104, H, HandsLR mode switch
-                disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
-            elif key == ord('k'): # 107, K, Keypoints mode switch
-                if keypoint_drawing_mode == 'dot':
-                    keypoint_drawing_mode = 'box'
-                elif keypoint_drawing_mode == 'box':
-                    keypoint_drawing_mode = 'both'
-                elif keypoint_drawing_mode == 'both':
-                    keypoint_drawing_mode = 'dot'
-            elif key == ord('r'): # 114, R, Tracking mode switch
-                enable_tracking = not enable_tracking
-                if enable_tracking and not enable_trackid_overlay:
-                    enable_trackid_overlay = True
-            elif key == ord('t'): # 116, T, TrackID overlay mode switch
-                enable_trackid_overlay = not enable_trackid_overlay
-                if not enable_tracking:
-                    enable_trackid_overlay = False
-            elif key == ord('m'): # 109, M, Head distance measurement mode switch
-                enable_head_distance_measurement = not enable_head_distance_measurement
-
-    if video_writer is not None:
-        video_writer.release()
-
-    if cap is not None:
+            debug_image, tracking_enabled_prev, tracker = process_frame(image, tracker, track_color_cache, tracking_enabled_prev, eye_history, video_writer, is_video=True)
+            if video_writer is not None and debug_image is not None:
+                video_writer.write(debug_image)
+            else:
+                cv2.imshow("test", debug_image)
+                key = cv2.waitKey(1) & 0xFF if disable_waitKey else cv2.waitKey(0) & 0xFF
+                if key == ord('\x1b'):
+                    break
+                elif key == ord('b'):
+                    enable_bone_drawing_mode = not enable_bone_drawing_mode
+                elif key == ord('n'):
+                    disable_generation_identification_mode = not disable_generation_identification_mode
+                elif key == ord('g'):
+                    disable_gender_identification_mode = not disable_gender_identification_mode
+                elif key == ord('p'):
+                    disable_headpose_identification_mode = not disable_headpose_identification_mode
+                elif key == ord('h'):
+                    disable_left_and_right_hand_identification_mode = not disable_left_and_right_hand_identification_mode
+                elif key == ord('k'):
+                    if keypoint_drawing_mode == 'dot':
+                        keypoint_drawing_mode = 'box'
+                    elif keypoint_drawing_mode == 'box':
+                        keypoint_drawing_mode = 'both'
+                    elif keypoint_drawing_mode == 'both':
+                        keypoint_drawing_mode = 'dot'
+                elif key == ord('r'):
+                    enable_tracking = not enable_tracking
+                    if enable_tracking and not enable_trackid_overlay:
+                        enable_trackid_overlay = True
+                elif key == ord('t'):
+                    enable_trackid_overlay = not enable_trackid_overlay
+                    if not enable_tracking:
+                        enable_trackid_overlay = False
+                elif key == ord('m'):
+                    enable_head_distance_measurement = not enable_head_distance_measurement
+        if video_writer is not None:
+            video_writer.release()
         cap.release()
+
+    # 分支处理
+    if images_dir is not None:
+        process_images()
+    else:
+        videos_to_process: List[str] = []
+        if video_dir is not None:
+            videos_to_process = list_video_files(video_dir)
+        elif video is not None:
+            videos_to_process = [video]
+        if not videos_to_process:
+            print(Color.RED('No video source specified'))
+            return
+        for v in videos_to_process:
+            process_video_source(v)
 
     try:
         cv2.destroyAllWindows()

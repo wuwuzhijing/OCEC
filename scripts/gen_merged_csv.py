@@ -3,10 +3,9 @@ import csv
 import argparse
 
 # --- 配置参数 ---
-# 根目录：包含所有 merged_x 文件夹的路径
-BASE_DIR = '/10/cvz/guochuang/dataset/Classification/fatigue/cropped_merge'
+BASE_DIR = '/ssddisk/guochuang/ocec/hq/'
 # CSV 文件输出目录
-OUTPUT_DIR = '/ssddisk/guochuang/ocec/list'
+OUTPUT_DIR = '/ssddisk/guochuang/ocec/list_hq_v3'
 
 def generate_csv_list(merged_indices):
     """

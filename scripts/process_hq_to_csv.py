@@ -130,7 +130,7 @@ def write_csv_file(entries: List[Tuple[str, int]], output_path: Path):
 def main():
     # 路径设置
     hq_dir = Path('/ssddisk/guochuang/ocec/hq')
-    csv_dir = Path('data/cropped/list')
+    csv_dir = Path('/ssddisk/guochuang/ocec/list_hq_v2/')
     
     if not hq_dir.exists():
         print(Color.RED(f'Directory not found: {hq_dir}'))

@@ -8,8 +8,8 @@
 # Option 2: Specify a directory (loads all annotation_*.csv files from that directory)
 # Split into multiple parquet files (50000 rows per file)
 python 04_dataset_convert_to_parquet.py \
---annotation /ssddisk/guochuang/ocec/list \
---output /ssddisk/guochuang/ocec/parquet_6Whq+24WPublic/dataset_6Whq+24WPublic.parquet \
+--annotation /ssddisk/guochuang/ocec/list_hq_v3 \
+--output /ssddisk/guochuang/ocec/parquet_hq_v3/dataset_hq.parquet \
 --train-ratio 0.8 \
 --seed 42 \
 --max-rows-per-file 50000 \
