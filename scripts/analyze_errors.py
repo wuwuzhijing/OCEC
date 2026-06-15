@@ -20,8 +20,15 @@ import argparse
 import io
 import json
 import math
+import sys
 from pathlib import Path
 from typing import List, Tuple
+
+# Ensure project root is on sys.path (for running from anywhere)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 import pandas as pd
