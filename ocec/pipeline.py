@@ -1019,6 +1019,51 @@ class RandomNoiseWrapper(torch.nn.Module):
         std = torch.empty(1).uniform_(self.min_std, self.max_std).item()
         return x + torch.randn_like(x) * std
 
+
+class RandomReflection(torch.nn.Module):
+    """Simulate glasses reflection: random semi-transparent bright Gaussian blobs.
+
+    Helps the model learn to ignore reflection artifacts that cause high-confidence
+    false positives on closed eyes behind glasses.
+    """
+
+    def __init__(self, p: float = 0.20, max_blobs: int = 3, opacity: float = 0.25):
+        super().__init__()
+        self.p = p
+        self.max_blobs = max_blobs
+        self.opacity = opacity
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) normalized tensor
+        if torch.rand(1).item() > self.p:
+            return x
+
+        B, C, H, W = x.shape
+        device = x.device
+
+        for b in range(B):
+            n_blobs = torch.randint(1, self.max_blobs + 1, (1,)).item()
+            for _ in range(n_blobs):
+                # Random position and size
+                cy = torch.randint(H // 4, 3 * H // 4, (1,)).item()
+                cx = torch.randint(W // 4, 3 * W // 4, (1,)).item()
+                sigma = torch.empty(1).uniform_(3.0, 8.0).item()
+
+                # Create 2D Gaussian blob
+                ys = torch.arange(H, device=device, dtype=torch.float32)
+                xs = torch.arange(W, device=device, dtype=torch.float32)
+                gy = torch.exp(-0.5 * ((ys - cy) / sigma) ** 2)
+                gx = torch.exp(-0.5 * ((xs - cx) / sigma) ** 2)
+                blob = torch.outer(gy, gx)  # (H, W)
+
+                # Random opacity
+                alpha = torch.empty(1).uniform_(0.05, self.opacity).item()
+                # Add brightness (positive value ≈ white in normalized space)
+                x[b] += blob.unsqueeze(0) * alpha
+
+        return x
+
+
 def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[float]):
     """Hybrid CPU + GPU transform: IR-friendly"""
     import albumentations as A
@@ -1055,20 +1100,18 @@ def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[floa
             p=0.30, padding_mode="zeros"
         ),
 
-        # GaussianBlur: tuple sigma sometimes works, but we lock range manually
-        K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.5, 1.2), p=0.10),
+        # v4.3: stronger blur (sigma up to 3.0) for motion blur / defocus robustness
+        K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.5, 3.0), p=0.20),
 
-        # ❗ GaussianNoise must use scalar std for Kornia 0.8.2
         RandomNoiseWrapper(),
 
         K.RandomBrightness(brightness=0.25, p=0.35),
         K.RandomContrast(contrast=0.25, p=0.35),
-        # ⚠️ 注意：Normalize 后图像会有负值，RandomGamma 会对负数做幂运算产生 NaN。
-        # 为避免 NaN，移除 RandomGamma，保留亮度扰动。
-        # Exposure 扰动：通过调整亮度范围模拟曝光变化
-        K.RandomBrightness(brightness=0.15, p=0.25),  # 额外的亮度扰动
+        K.RandomBrightness(brightness=0.15, p=0.25),
 
-        # Kornia 0.8.2 JPEG API
+        # v4.3: simulate glasses reflection
+        RandomReflection(p=0.20, max_blobs=3, opacity=0.25),
+
         K.RandomJPEG(jpeg_quality=(50, 90), p=0.20),
     )
 
