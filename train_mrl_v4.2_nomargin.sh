@@ -11,7 +11,7 @@ RESUME_FROM=""
 RESUME_LR="5e-5"
 BACKBONE="repvgg_b0"
 WEIGHTS_DIR="/ssddisk/guochuang/ocec/pretrained_weights"
-OUTPUT_DIR="runs/ocec_mrl_v4_nomargin"
+OUTPUT_DIR="runs/ocec_mrl_v4.2_nomargin"
 # ==========================
 
 export OCEC_ARGS="train \
@@ -34,15 +34,15 @@ export OCEC_ARGS="train \
     --pretrained_backbone ${BACKBONE} \
     --pretrained_weights_dir ${WEIGHTS_DIR}"
 
-LOG_FILE="logs/train/mrl/train_mrl_v4_nomargin_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="logs/train/mrl/train_mrl_v4.2_nomargin_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p logs/train/mrl
 
-nohup bash -c "source \$(conda info --base)/etc/profile.d/conda.sh && conda activate tf_310 && exec -a mrl_nomargin python - << 'EOF'
+nohup bash -c "source \$(conda info --base)/etc/profile.d/conda.sh && conda activate tf_310 && exec -a mrl_v4.2_nomargin python - << 'EOF'
 import os, shlex
 from ocec.__main__ import main
 args = shlex.split(os.environ['OCEC_ARGS'])
 main(args)
 EOF" > ${LOG_FILE} 2>&1 &
 
-echo "v4 no-margin baseline 已启动 (port 6008)"
+echo "v4.2 no-margin baseline 已启动 (port 6008)"
 echo "日志: ${LOG_FILE}"
