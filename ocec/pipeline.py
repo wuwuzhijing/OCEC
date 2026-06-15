@@ -2147,18 +2147,16 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                         tb_port = port
                         break
             
-            # 启动TensorBoard
-            tb_cmd = [
-                "tensorboard",
-                "--logdir", str(tb_dir),
-                "--port", str(tb_port),
-                "--host", "0.0.0.0",  # 允许外部访问
-            ]
+            # 启动TensorBoard（进程名隐藏，与主训练一致）
+            tb_cmd = (
+                f"exec -a .tb_{tb_port} tensorboard "
+                f"--logdir {tb_dir} --port {tb_port} --host 0.0.0.0"
+            )
             tb_process = subprocess.Popen(
-                tb_cmd,
+                ["bash", "-c", tb_cmd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True  # 创建新的进程组，避免训练结束时被终止
+                start_new_session=True,
             )
             LOGGER.info(f"TensorBoard started automatically at http://localhost:{tb_port}")
             LOGGER.info(f"TensorBoard log directory: {tb_dir}")
