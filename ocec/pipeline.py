@@ -863,7 +863,10 @@ class TrainConfig:
     unfreeze_backbone_epoch_stage3: Optional[int] = None  # Stage3 解冻 epoch（通常设为 1000+）
     unfreeze_backbone_ratio_stage3: float = 0.25  # Stage3 解冻比例（解冻最后 1-2 个 stage，约 25%）
     stage3_lr: Optional[float] = None  # Stage3 学习率（默认 stage2_lr * 0.5）
+    unfreeze_all_after_resume: bool = False  # resume 后若达到阈值则全解冻
+    unfreeze_all_f1_threshold: float = 0.85  # 全解冻触发的 F1 阈值
     neg_class_weight: float = 1.2  # 负类在 loss 中的权重（提升 precision）
+    tb_port: int = 0  # TensorBoard 端口（0=自动扫描 6006-6009）
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1058,8 +1061,8 @@ def _build_transforms(image_size: Any, mean: Sequence[float], std: Sequence[floa
 
         K.RandomBrightness(brightness=0.25, p=0.35),
         K.RandomContrast(contrast=0.25, p=0.35),
-        # Gamma 校正：增强光照随机性
-        K.RandomGamma(gamma=(0.8, 1.2), gain=(0.9, 1.1), p=0.30),
+        # ⚠️ 注意：Normalize 后图像会有负值，RandomGamma 会对负数做幂运算产生 NaN。
+        # 为避免 NaN，移除 RandomGamma，保留亮度扰动。
         # Exposure 扰动：通过调整亮度范围模拟曝光变化
         K.RandomBrightness(brightness=0.15, p=0.25),  # 额外的亮度扰动
 
@@ -1120,9 +1123,9 @@ def _unfreeze_backbone_last_layers(model: nn.Module, num_layers: int = 2, ratio:
         num_layers = max(1, int(num_blocks * ratio))
         LOGGER.info(f"Unfreezing {ratio:.1%} of backbone ({num_layers}/{num_blocks} blocks)")
     else:
-    if num_layers > num_blocks:
-        LOGGER.warning(f"Requested {num_layers} layers but only {num_blocks} blocks available, unfreezing all blocks")
-        num_layers = num_blocks
+        if num_layers > num_blocks:
+            LOGGER.warning(f"Requested {num_layers} layers but only {num_blocks} blocks available, unfreezing all blocks")
+            num_layers = num_blocks
     
     # 解冻最后N个block
     unfrozen_count = 0
@@ -1222,13 +1225,27 @@ def _run_epoch(
     margin_stats = None
 
     iterator = dataloader
+    pbar = None
+    update_interval = 1
     if progress_desc:
-        iterator = tqdm(iterator, desc=progress_desc, leave=False, dynamic_ncols=True)
+        num_batches = len(dataloader)
+        update_interval = max(1, num_batches // 3)  # 每个epoch更新约3次
+        pbar = tqdm(total=num_batches, desc=progress_desc, leave=False, dynamic_ncols=True)
+        iterator = iter(dataloader)
 
     slice_enabled = enable_slice_training
     easy_end, medium_end = slice_stage_epochs
 
+    batch_idx = 0
     for batch in iterator:
+        batch_idx += 1
+        if pbar:
+            if batch_idx == num_batches:
+                # 最后一个batch，更新剩余数量
+                pbar.update(num_batches - pbar.n)
+            elif batch_idx % update_interval == 0:
+                # 达到更新间隔，更新update_interval个（但排除最后一个batch）
+                pbar.update(update_interval)
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True).long()
 
@@ -1298,21 +1315,66 @@ def _run_epoch(
             
             logits, embedding = forward_out
 
-            # ---- Unified probability calculation (ALWAYS from margin_head if enabled) ----
-                    with torch.no_grad():
-                if hasattr(model, "module"):
-                            margin_head = model.module.margin_head
+            # 在恢复训练阶段仍然出现 NaN 指标时，为了更精确定位问题，这里增加一次前向输出的
+            # NaN/Inf 检查。如果发现问题，立即记录详细调试信息并抛出异常，而不是继续用 NaN 训练。
+            if torch.isnan(embedding).any() or torch.isinf(embedding).any() \
+               or torch.isnan(logits).any() or torch.isinf(logits).any():
+                # 仅打印一次较简洁的统计信息，避免日志爆炸
+                with torch.no_grad():
+                    def _finite_stats(t: torch.Tensor):
+                        mask = torch.isfinite(t)
+                        if mask.any():
+                            t_f = t[mask]
+                            return (
+                                float(t_f.min()),
+                                float(t_f.max()),
+                                float(t_f.mean()),
+                                int(mask.sum().item()),
+                                int(mask.numel()),
+                            )
                         else:
-                            margin_head = model.margin_head
-                        
+                            return float("nan"), float("nan"), float("nan"), 0, int(mask.numel())
+
+                    emb_min, emb_max, emb_mean, emb_finite_count, emb_total = _finite_stats(embedding)
+                    log_min, log_max, log_mean, log_finite_count, log_total = _finite_stats(logits)
+                    
+                    # 检查输入图像是否有异常
+                    img_min = float(images.min())
+                    img_max = float(images.max())
+                    img_mean = float(images.mean())
+                    img_has_nan = torch.isnan(images).any().item()
+                    img_has_inf = torch.isinf(images).any().item()
+
+                LOGGER.error(
+                    f"[NumericalError] Detected NaN/Inf in model outputs at epoch={epoch}, "
+                    f"split={split_name}, batch_size={images.size(0)}. "
+                    f"Input images: mean={img_mean:.6f}, range=[{img_min:.6f}, {img_max:.6f}], "
+                    f"has_nan={img_has_nan}, has_inf={img_has_inf}. "
+                    f"Embedding: mean={emb_mean:.6f}, range=[{emb_min:.6f}, {emb_max:.6f}], "
+                    f"finite={emb_finite_count}/{emb_total}. "
+                    f"Logits: mean={log_mean:.6f}, range=[{log_min:.6f}, {log_max:.6f}], "
+                    f"finite={log_finite_count}/{log_total}."
+                )
+                raise RuntimeError(
+                    "Model forward produced NaN/Inf logits or embeddings. "
+                    "Please check recent checkpoint, optimizer state, and learning rate schedule."
+                )
+
+            # ---- Unified probability calculation (ALWAYS from margin_head if enabled) ----
+            with torch.no_grad():
+                if hasattr(model, "module"):
+                    margin_head = model.module.margin_head
+                else:
+                    margin_head = model.margin_head
+
                 if margin_method in ["arcface", "cosface"] and margin_head is not None:
                     clean_logits = margin_head(embedding, labels=None)
                     probs = torch.softmax(clean_logits, dim=1)[:, 1]
-                        else:
+                else:
                     # fallback to BCE-style or raw logits if no margin_head active
-                            if logits.ndim == 2 and logits.size(1) == 2:
-                                probs = torch.softmax(logits, dim=1)[:, 1]
-                            else:
+                    if logits.ndim == 2 and logits.size(1) == 2:
+                        probs = torch.softmax(logits, dim=1)[:, 1]
+                    else:
                         probs = torch.sigmoid(logits.squeeze())
 
             # ---- Pseudo label update ----
@@ -1323,7 +1385,7 @@ def _run_epoch(
                 # assign soft label but only where uncertain
                 pseudo_labels[uncertain_mask] = probs[uncertain_mask].to(pseudo_labels.dtype)
                 used_labels = pseudo_labels   # mixed (hard + soft)
-                else:
+            else:
                 used_labels = labels.float()  # consistent dtype later
 
             # ---- Loss scheduling ----
@@ -1340,7 +1402,7 @@ def _run_epoch(
                     logits = torch.cat([-logits, logits], dim=1)  # binary -> 2 class
                 if used_labels.dtype == torch.long:
                     loss = ce_loss_fn(logits, used_labels)
-                        else:
+                else:
                     log_prob = torch.log_softmax(logits, dim=1)
                     soft_target = torch.stack([1 - used_labels, used_labels], dim=1)
                     loss = -(soft_target * log_prob).sum(dim=1).mean()
@@ -1378,7 +1440,7 @@ def _run_epoch(
                 # total
                 loss = (1 - hybrid_ratio) * ce_hard + 0.5 * hybrid_ratio * ce_soft + 0.5 * hybrid_ratio * focal_soft
 
-                        else:
+            else:
                 # Full adaptive focal w/ soft labels
                 pos_ratio = labels.float().mean().item()
                 neg_ratio = 1.0 - pos_ratio
@@ -1387,9 +1449,9 @@ def _run_epoch(
                 loss = focal_loss_fn(logits, used_labels)
 
             # ---- Logging values for visualization ----
-                logits_for_debug = logits
+            logits_for_debug = logits
             confidence = probs.clone().detach().cpu()
-        
+
         if train_mode:
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1565,6 +1627,9 @@ def _run_epoch(
             "embeddings": torch.cat(all_embeddings).numpy() if all_embeddings else None,
             "margin_stats": margin_stats,
         }
+    
+    if pbar:
+        pbar.close()
         
     return metrics, extras
 
@@ -2068,14 +2133,17 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         if shutil.which("tensorboard"):
             # 查找可用端口
             import socket
-            tb_port = 6006
-            for port in range(6006, 6010):
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                result = sock.connect_ex(('127.0.0.1', port))
-                sock.close()
-                if result != 0:  # 端口未被占用
-                    tb_port = port
-                    break
+            if config.tb_port > 0:
+                tb_port = config.tb_port
+            else:
+                tb_port = 6006
+                for port in range(6006, 6010):
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    result = sock.connect_ex(('127.0.0.1', port))
+                    sock.close()
+                    if result != 0:
+                        tb_port = port
+                        break
             
             # 启动TensorBoard
             tb_cmd = [
@@ -2273,6 +2341,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    # 注意：不要在创建优化器之前解冻backbone
+    # 我们应该先创建优化器并加载状态，然后再解冻并添加新参数
+    # 这样可以保留已训练参数的优化器历史状态
+
     optimizer = torch.optim.AdamW(
         (param for param in model.parameters() if param.requires_grad),
         lr=config.lr,
@@ -2284,15 +2356,15 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         optimizer, mode="min", factor=0.5, patience=2
     )
     
-    # 如果启用warmup，创建组合调度器
+    # 定义warmup lambda函数（在恢复训练时可能需要重新创建调度器）
     warmup_epochs = config.warmup_epochs
+    def warmup_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        return 1.0
+    
+    # 如果启用warmup，创建组合调度器
     if warmup_epochs > 0:
-        # Warmup阶段：线性增加学习率从0到目标学习率
-        def warmup_lambda(epoch):
-            if epoch < warmup_epochs:
-                return (epoch + 1) / warmup_epochs
-            return 1.0
-        
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
         scheduler = {"type": "warmup", "warmup": warmup_scheduler, "main": main_scheduler, "warmup_epochs": warmup_epochs}
         LOGGER.info(f"Using warmup scheduler: {warmup_epochs} epochs of linear warmup, then ReduceLROnPlateau")
@@ -2350,8 +2422,236 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             model_state = {k.replace("module.", ""): v for k, v in model_state.items() if k.startswith("module.")}
         
         model.load_state_dict(model_state)
+        
+        # 检查模型加载后的状态
+        base_model = model.module if hasattr(model, 'module') else model
+        trainable_params = sum(1 for p in base_model.parameters() if p.requires_grad)
+        backbone_trainable = sum(1 for name, p in base_model.named_parameters() 
+                                 if ('stem' in name or 'features' in name) and p.requires_grad)
+        LOGGER.info(f"After loading checkpoint: {trainable_params} trainable parameters total, {backbone_trainable} from backbone")
+        
+        # 检查模型权重是否有NaN或Inf
+        has_nan = False
+        has_inf = False
+        for name, param in base_model.named_parameters():
+            if torch.isnan(param).any():
+                LOGGER.error(f"Parameter {name} contains NaN after loading checkpoint!")
+                has_nan = True
+            if torch.isinf(param).any():
+                LOGGER.error(f"Parameter {name} contains Inf after loading checkpoint!")
+                has_inf = True
+        if has_nan or has_inf:
+            raise RuntimeError("Model contains NaN or Inf values after loading checkpoint! This will cause training to fail.")
+        
+        # 获取恢复的验证指标（用于后续的学习率调整）
+        resume_val_metrics = copy.deepcopy(resume_payload.get("val_metrics") or None)
+        
+        # 先加载优化器状态
+        # 注意：早期我们尝试根据 checkpoint 中的学习率来“猜测”优化器是不是刚刚被重新创建，
+        # 并在认为是“fresh optimizer”时跳过 optimizer_state 的加载。
+        # 实战日志表明，这个启发式有误，会把已经稳定训练过很多 step 的优化器误判为“fresh”，
+        # 进而丢弃成熟的动量历史，导致恢复训练初期数值不稳定甚至 NaN。
+        # 因此，这里统一：**总是加载 checkpoint 中的 optimizer_state**，再在加载后做 NaN/Inf 检查，
+        # 一旦发现异常再重置状态，而不是事先主观跳过加载。
         if resume_payload.get("optimizer_state"):
-            optimizer.load_state_dict(resume_payload["optimizer_state"])
+            try:
+                # 检查 checkpoint 中的优化器学习率，仅用于日志记录和排查，而不再决定是否加载状态
+                ckpt_opt_state = resume_payload["optimizer_state"]
+                ckpt_lr = None
+                if ckpt_opt_state.get("param_groups"):
+                    ckpt_lr = ckpt_opt_state["param_groups"][0].get("lr")
+                
+                if ckpt_lr is not None:
+                    LOGGER.info(f"Checkpoint optimizer LR={ckpt_lr:.6f} (will load optimizer state from checkpoint)")
+                else:
+                    LOGGER.info("Checkpoint optimizer LR is not available in optimizer_state; will still load optimizer state.")
+
+                # 直接加载优化器状态，让优化器完全恢复到训练结束时的状态（包括动量等内部缓冲）
+                optimizer.load_state_dict(resume_payload["optimizer_state"])
+                LOGGER.info("Successfully loaded optimizer state from checkpoint")
+                
+                # 检查优化器中的参数数量
+                optimizer_param_count = sum(len(group['params']) for group in optimizer.param_groups)
+                LOGGER.info(f"Optimizer has {len(optimizer.param_groups)} parameter groups with {optimizer_param_count} parameters")
+                
+                # 检查优化器状态是否有NaN或Inf（如果加载了状态）
+                optimizer_has_nan = False
+                optimizer_has_inf = False
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if param in optimizer.state:
+                            state = optimizer.state[param]
+                            for key, value in state.items():
+                                if isinstance(value, torch.Tensor):
+                                    if torch.isnan(value).any():
+                                        LOGGER.error(f"Optimizer state contains NaN for parameter in '{key}' after loading checkpoint!")
+                                        optimizer_has_nan = True
+                                    if torch.isinf(value).any():
+                                        LOGGER.error(f"Optimizer state contains Inf for parameter in '{key}' after loading checkpoint!")
+                                        optimizer_has_inf = True
+                
+                if optimizer_has_nan or optimizer_has_inf:
+                    LOGGER.warning("Found NaN/Inf in optimizer state after loading. Resetting optimizer state to prevent training failure.")
+                    # 重置所有优化器状态
+                    optimizer.state = {}
+                    LOGGER.info("Reset optimizer state. Training will start with fresh optimizer state.")
+            except Exception as e:
+                LOGGER.warning(f"Failed to load optimizer state: {e}. Continuing with fresh optimizer state.")
+        
+        # 现在解冻backbone并添加新参数到优化器（保留已训练参数的优化器状态）
+        need_adjust_lr = False
+        checkpoint_f1_for_lr = None
+        if config.unfreeze_all_after_resume:
+            if resume_val_metrics is not None:
+                checkpoint_f1_for_lr = resume_val_metrics.get("f1", 0)
+            if checkpoint_f1_for_lr is not None:
+                need_adjust_lr = True
+        
+        if need_adjust_lr:
+            LOGGER.info("Checking backbone state and adjusting learning rates for unfrozen backbone parameters")
+            # 获取当前优化器中的参数ID集合
+            existing_param_ids = set()
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    existing_param_ids.add(id(param))
+            
+            # 检查backbone当前状态
+            base_model = model.module if hasattr(model, 'module') else model
+            backbone_params = []
+            for name, param in base_model.named_parameters():
+                if ('stem' in name or 'features' in name) and param.requires_grad:
+                    backbone_params.append((name, param))
+            
+            # 确定需要的学习率
+            if checkpoint_f1_for_lr >= config.unfreeze_all_f1_threshold:
+                # 完全解冻
+                LOGGER.info(f"Checkpoint F1={checkpoint_f1_for_lr:.4f} >= {config.unfreeze_all_f1_threshold}, ensuring all backbone is unfrozen")
+                _unfreeze_backbone_fully(model)
+                # 确定学习率
+                if config.stage3_lr is not None:
+                    unfreeze_lr = config.stage3_lr
+                elif config.stage2_lr is not None:
+                    unfreeze_lr = config.stage2_lr * 0.5
+                else:
+                    unfreeze_lr = config.lr * 0.025
+            else:
+                # 部分解冻
+                unfreeze_ratio = getattr(config, 'unfreeze_backbone_ratio', 0.5)
+                LOGGER.info(f"Checkpoint F1={checkpoint_f1_for_lr:.4f} < {config.unfreeze_all_f1_threshold}, ensuring {unfreeze_ratio:.1%} of backbone is unfrozen")
+                _unfreeze_backbone_last_layers(model, num_layers=2, ratio=unfreeze_ratio)
+                # 确定学习率
+                if config.stage2_lr is not None:
+                    unfreeze_lr = config.stage2_lr
+                else:
+                    unfreeze_lr = config.lr * 0.05
+            
+            # 找到新解冻的参数（不在现有优化器中的参数）
+            new_params = []
+            updated_existing_params = []
+            for name, param in base_model.named_parameters():
+                if param.requires_grad:
+                    param_id = id(param)
+                    if param_id not in existing_param_ids:
+                        # 新解冻的参数
+                        new_params.append(param)
+                    elif ('stem' in name or 'features' in name):
+                        # 已经在优化器中的backbone参数，需要调整学习率
+                        updated_existing_params.append((name, param_id))
+            
+            # 如果有新参数，使用add_param_group添加
+            if new_params:
+                optimizer.add_param_group({
+                    'params': new_params,
+                    'lr': unfreeze_lr,
+                    'weight_decay': config.weight_decay
+                })
+                LOGGER.info(f"Added {len(new_params)} newly unfrozen parameters to optimizer with LR={unfreeze_lr:.6f}")
+            
+            # 调整已有backbone参数的学习率
+            # 注意：当学习率发生显著变化时，旧的momentum buffers（exp_avg, exp_avg_sq）可能与新学习率不匹配，
+            # 导致第一次step时更新步长异常。因此，在调整学习率后，需要重置受影响参数的优化器状态。
+            if updated_existing_params:
+                lr_changed_params = []
+                old_lr = None
+                for name, param_id in updated_existing_params:
+                    for param_group in optimizer.param_groups:
+                        if any(id(p) == param_id for p in param_group['params']):
+                            old_lr = param_group['lr']
+                            param_group['lr'] = unfreeze_lr
+                            # 记录需要重置状态的参数
+                            for p in param_group['params']:
+                                if id(p) == param_id:
+                                    lr_changed_params.append(p)
+                            break
+                
+                if old_lr is not None and abs(unfreeze_lr - old_lr) / max(abs(old_lr), 1e-8) > 0.1:  # 学习率变化超过10%
+                    LOGGER.info(
+                        f"Learning rate changed significantly (from {old_lr:.6f} to {unfreeze_lr:.6f}, "
+                        f"ratio={unfreeze_lr/old_lr:.2f}x). Resetting optimizer state for affected parameters "
+                        f"to prevent momentum mismatch."
+                    )
+                    # 重置受影响参数的优化器状态
+                    for param in lr_changed_params:
+                        if param in optimizer.state:
+                            optimizer.state[param] = {}
+                    LOGGER.info(f"Reset optimizer state for {len(lr_changed_params)} parameters with changed learning rate.")
+                
+                LOGGER.info(f"Updated learning rate for {len(updated_existing_params)} existing backbone parameters to LR={unfreeze_lr:.6f}")
+            
+            # 在调整学习率后，再次检查优化器状态是否有NaN或Inf
+            optimizer_has_nan = False
+            optimizer_has_inf = False
+            affected_params = []
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    if param in optimizer.state:
+                        state = optimizer.state[param]
+                        for key, value in state.items():
+                            if isinstance(value, torch.Tensor):
+                                if torch.isnan(value).any():
+                                    LOGGER.warning(f"Optimizer state for parameter contains NaN in '{key}' after LR adjustment")
+                                    optimizer_has_nan = True
+                                    affected_params.append(id(param))
+                                if torch.isinf(value).any():
+                                    LOGGER.warning(f"Optimizer state for parameter contains Inf in '{key}' after LR adjustment")
+                                    optimizer_has_inf = True
+                                    affected_params.append(id(param))
+            
+            # 如果优化器状态有问题，重新初始化受影响参数的状态
+            if optimizer_has_nan or optimizer_has_inf:
+                LOGGER.warning("Found NaN/Inf in optimizer state after LR adjustment. Resetting optimizer state for affected parameters.")
+                # 重置受影响参数的状态
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if id(param) in affected_params and param in optimizer.state:
+                            # 重置这个参数的状态
+                            optimizer.state[param] = {}
+                            LOGGER.info(f"Reset optimizer state for parameter (will start with fresh state)")
+            
+            if new_params or updated_existing_params:
+                # 标记已触发解冻
+                if checkpoint_f1_for_lr >= config.unfreeze_all_f1_threshold:
+                    unfreeze_all_triggered = True
+            else:
+                LOGGER.warning("No backbone parameters found to adjust. Backbone may already be in the desired state.")
+        
+        # 确保模型处于训练模式
+        model.train()
+        
+        # 验证模型可以正常前向传播（使用一个小的dummy输入）
+        try:
+            base_model = model.module if hasattr(model, 'module') else model
+            dummy_input = torch.randn(2, 3, config.image_size[0], config.image_size[1]).to(next(model.parameters()).device)
+            with torch.no_grad():
+                dummy_output = base_model(dummy_input)
+                if torch.isnan(dummy_output).any() or torch.isinf(dummy_output).any():
+                    LOGGER.error("Model produces NaN/Inf in forward pass after loading checkpoint!")
+                    raise RuntimeError("Model forward pass produces NaN/Inf. Check model weights and architecture.")
+                LOGGER.info("Model forward pass validation successful")
+        except Exception as e:
+            LOGGER.error(f"Model forward pass validation failed: {e}")
+            raise
+        
         if resume_payload.get("scheduler_state"):
             # 恢复调度器状态
             scheduler_state = resume_payload["scheduler_state"]
@@ -2384,7 +2684,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
 
         start_epoch = resume_epoch + 1
         resume_train_metrics = copy.deepcopy(resume_payload.get("train_metrics") or {})
-        resume_val_metrics = copy.deepcopy(resume_payload.get("val_metrics") or None)
+        # resume_val_metrics 已经在前面定义过了，这里不需要重复定义
+        # resume_val_metrics = copy.deepcopy(resume_payload.get("val_metrics") or None)
         best_val_loss = resume_payload.get("best_val_loss")
         if best_val_loss is None:
             best_val_loss = (
@@ -2449,8 +2750,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 start_epoch - 1,
                 config.epochs,
             )
+    
     # 使用 None 初始化，保持类型一致（后续按字典访问）
     val_metrics = None
+    unfreeze_all_triggered = False  # 标记是否已经触发完全解冻
     for epoch in range(start_epoch, config.epochs + 1):
         LOGGER.info(f"Epoch {epoch}/{config.epochs}")
         
@@ -2458,7 +2761,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             model_dict = model.module
             model_dict.current_epoch = epoch
         else:
-            model_dict = model.module
+            model_dict = model
             model_dict.current_epoch = epoch
 
         if config.unfreeze_backbone_epoch is not None and epoch >= config.unfreeze_backbone_epoch:
@@ -2782,6 +3085,31 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             ema.restore(model)
             # 恢复训练模式
             model.train()
+            
+            # 处理恢复训练后的完全解冻逻辑（在验证完成后检查）
+            if config.unfreeze_all_after_resume and not unfreeze_all_triggered:
+                # 检查是否达到F1阈值
+                current_f1 = val_metrics.get("f1", 0) if val_metrics is not None else None
+                if current_f1 is not None and current_f1 >= config.unfreeze_all_f1_threshold:
+                    LOGGER.info(f"Epoch {epoch}: F1={current_f1:.4f} >= {config.unfreeze_all_f1_threshold}, unfreezing all backbone")
+                    _unfreeze_backbone_fully(model)
+                    # 更新优化器参数组，添加新解冻的参数
+                    trainable_params = [param for param in model.parameters() if param.requires_grad]
+                    optimizer_param_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+                    new_params = [p for p in trainable_params if id(p) not in optimizer_param_ids]
+                    if new_params:
+                        # 使用stage3_lr作为学习率
+                        if config.stage3_lr is not None:
+                            unfreeze_lr = config.stage3_lr
+                        elif config.stage2_lr is not None:
+                            unfreeze_lr = config.stage2_lr * 0.5
+                        else:
+                            unfreeze_lr = config.lr * 0.025
+                        optimizer.add_param_group({'params': new_params, 'lr': unfreeze_lr, 'weight_decay': config.weight_decay})
+                        LOGGER.info(f"Added {len(new_params)} fully unfrozen parameters to optimizer with LR: {unfreeze_lr:.6f}")
+                    unfreeze_all_triggered = True
+                elif current_f1 is not None:
+                    LOGGER.info(f"Epoch {epoch}: F1={current_f1:.4f} < {config.unfreeze_all_f1_threshold}, waiting for threshold to unfreeze all backbone")
         else:
             val_metrics, val_outputs = None, None
         if epoch % 50 == 0:
@@ -3527,6 +3855,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--freeze_backbone", action="store_true", help="Freeze backbone layers, only train head and margin_head (for fine-tuning).")
     train_parser.add_argument("--unfreeze_backbone_epoch", type=int, default=None, help="Epoch to unfreeze last 2 layers of backbone (for progressive fine-tuning).")
     train_parser.add_argument("--stage2_lr", type=float, default=None, help="Learning rate for stage 2 (after unfreezing backbone). If not specified, uses lr * 0.05.")
+    train_parser.add_argument("--stage3_lr", type=float, default=None, help="Learning rate for stage 3 (further unfreezing).")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
     train_parser.add_argument(
         "--margin_method",
@@ -3543,9 +3872,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument("--pseudo_update_start_epoch", type=int, default=25, help="Delay pseudo-labeling until this epoch.")
     train_parser.add_argument("--neg_class_weight", type=float, default=1.2, help="Weight for negative class in loss (default: 1.2, higher = more focus on precision).")
+    train_parser.add_argument("--tb_port", type=int, default=0, help="TensorBoard port (default: 0 = auto-scan 6006-6009).")
     train_parser.add_argument("--unfreeze_backbone_ratio", type=float, default=0.5, help="Ratio of backbone to unfreeze in Stage2 (default: 0.5 = last half).")
     train_parser.add_argument("--enable_hard_negative_mining", action="store_true", help="Enable hard negative mining (detect and log false positives).")
     train_parser.add_argument("--hard_neg_min_prob", type=float, default=0.7, help="Minimum probability threshold for hard negatives (default: 0.7).")
+    train_parser.add_argument("--hard_neg_weight", type=float, default=2.0, help="Sampling weight for hard negatives (default: 2.0).")
+    train_parser.add_argument("--unfreeze_all_after_resume", action="store_true", help="After resume, unfreeze all backbone if F1 threshold met.")
+    train_parser.add_argument("--unfreeze_all_f1_threshold", type=float, default=0.85, help="F1 threshold to trigger full unfreeze after resume.")
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -3647,11 +3980,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             freeze_backbone=args.freeze_backbone,
             unfreeze_backbone_epoch=args.unfreeze_backbone_epoch,
             stage2_lr=args.stage2_lr,
+            stage3_lr=args.stage3_lr,
             pseudo_update_start_epoch=args.pseudo_update_start_epoch,
             neg_class_weight=getattr(args, 'neg_class_weight', 1.2),
             unfreeze_backbone_ratio=getattr(args, 'unfreeze_backbone_ratio', 0.5),
             enable_hard_negative_mining=getattr(args, 'enable_hard_negative_mining', False),
             hard_neg_min_prob=getattr(args, 'hard_neg_min_prob', 0.7),
+            hard_neg_weight=getattr(args, 'hard_neg_weight', 2.0),
+            unfreeze_all_after_resume=getattr(args, 'unfreeze_all_after_resume', False),
+            unfreeze_all_f1_threshold=getattr(args, 'unfreeze_all_f1_threshold', 0.85),
+            tb_port=getattr(args, 'tb_port', 0),
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":
