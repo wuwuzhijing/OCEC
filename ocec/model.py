@@ -95,7 +95,8 @@ class ModelConfig:
     token_mixer_grid: tuple[int, int] = (2, 3)
     token_mixer_layers: int = 2
     margin_method: str = "cosface"  # "none", "arcface", "cosface"
-    pretrained_backbone: str = ""  # "" = custom; or "mobilenet_v3_small", "efficientnet_b0", "resnet18"
+    pretrained_backbone: str = ""  # "" = custom; or "mobilenet_v3_small", "efficientnet_b0", "resnet18", "repvgg_b0", ...
+    pretrained_weights_dir: str = ""  # local dir for pre-downloaded weights (avoids network)
 
 
 class _SepConvBlock(nn.Module):
@@ -524,8 +525,14 @@ class OCEC(nn.Module):
 
         Supports torchvision models (mobilenet_v3_small, efficientnet_b0, resnet18,
         resnet34) and timm models (repvgg_*, and any other timm model).
+
+        Pre-downloaded weights can be placed in pretrained_weights_dir to skip network.
         """
         print(f"Loading pretrained backbone: {name}")
+
+        weights_dir = (self.config.pretrained_weights_dir or "").strip()
+        if weights_dir:
+            print(f"  Looking for local weights in: {weights_dir}")
 
         # ── torchvision backbones ──
         _TV_MODELS = {
@@ -539,20 +546,24 @@ class OCEC(nn.Module):
             from torchvision import models
 
             if name == "mobilenet_v3_small":
-                model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+                model = models.mobilenet_v3_small(weights=None)  # no auto-download
                 features = model.features
             elif name == "efficientnet_b0":
-                model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+                model = models.efficientnet_b0(weights=None)
                 features = model.features
             elif name in ("resnet18", "resnet34"):
-                weight_cls = models.ResNet18_Weights if name == "resnet18" else models.ResNet34_Weights
                 model_cls = models.resnet18 if name == "resnet18" else models.resnet34
-                model = model_cls(weights=weight_cls.IMAGENET1K_V1)
+                model = model_cls(weights=None)
                 features = nn.Sequential(
                     model.conv1, model.bn1, model.relu, model.maxpool,
                     model.layer1, model.layer2, model.layer3, model.layer4,
                 )
             out_channels = _TV_MODELS[name]
+
+            # Load weights from local dir if provided
+            if weights_dir:
+                self._load_weights_from_dir(features if not isinstance(features, nn.Sequential) or name not in ("resnet18", "resnet34") else model, name, weights_dir)
+                print(f"  Loaded local weights for: {name}")
 
         else:
             # ── timm backbones (repvgg_*, etc.) ──
@@ -563,13 +574,48 @@ class OCEC(nn.Module):
                     f"timm is required for backbone '{name}'. Install with: pip install timm"
                 )
 
-            # num_classes=0 + global_pool='' → raw feature map output (no pooling, no classifier)
-            model = timm.create_model(name, pretrained=True, num_classes=0, global_pool='')
+            if weights_dir:
+                # Create model without pretrained, load local weights
+                model = timm.create_model(name, pretrained=False, num_classes=0, global_pool='')
+                self._load_weights_from_dir(model, name, weights_dir)
+                print(f"  Loaded local weights for: {name}")
+            else:
+                # Auto-download from huggingface
+                model = timm.create_model(name, pretrained=True, num_classes=0, global_pool='')
+
             features = model
             out_channels = model.num_features
 
         print(f"  Pretrained backbone loaded: {name} (output channels={out_channels})")
         return features, out_channels
+
+    @staticmethod
+    def _load_weights_from_dir(model: nn.Module, name: str, weights_dir: str) -> None:
+        """Load pretrained weights from a local directory.
+
+        Tries: {dir}/{name}.pth, {dir}/{name}.safetensors, {dir}/{name}.pt
+        """
+        import os
+        candidates = [
+            os.path.join(weights_dir, f"{name}.pth"),
+            os.path.join(weights_dir, f"{name}.safetensors"),
+            os.path.join(weights_dir, f"{name}.pt"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                print(f"  Found: {path}")
+                state_dict = torch.load(path, map_location="cpu", weights_only=True)
+                # Handle wrapped state dicts (some repos wrap in 'model' or 'state_dict')
+                if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+                elif isinstance(state_dict, dict) and "model" in state_dict:
+                    state_dict = state_dict["model"]
+                model.load_state_dict(state_dict, strict=False)
+                return
+        raise FileNotFoundError(
+            f"Could not find weights for '{name}' in {weights_dir}. "
+            f"Tried: {candidates}"
+        )
 
     def _init_head_weights(self) -> None:
         """Initialize ONLY head and margin_head weights (skip pretrained backbone)."""

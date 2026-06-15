@@ -865,7 +865,7 @@ class OCEC(AbstractModel):
         prob_open = float(np.squeeze(outputs[0]))
 
         # 温度缩放：在概率域先转logit再缩放，增强置信度
-        alpha = 1.5  # 可根据验证集调节
+        alpha = 1.5
         p = np.clip(prob_open, 1e-6, 1 - 1e-6)
         logit = np.log(p / (1 - p))
         p_scaled = 1 / (1 + np.exp(-alpha * logit))
@@ -883,6 +883,10 @@ class OCEC(AbstractModel):
             raise ValueError('Invalid target size for OCEC preprocessing.')
         resized = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
         resized = resized.astype(np.float32) / 255.0
+        # 标准化
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        resized = (resized - mean) / std
         resized = resized.transpose(self._swap)
         return np.ascontiguousarray(resized, dtype=np.float32)
 
@@ -1524,7 +1528,7 @@ def main():
             except Exception:
                 continue
             box.eye_prob_open = prob_open
-            box.eye_state = 1 if prob_open >= 0.6 else 0
+            box.eye_state = 1 if prob_open >= 0.75 else 0
             state_text = 'Open_{}'.format(f'{prob_open:.2f}') if box.eye_state == 1 else 'Closed_{}'.format(f'{prob_open:.2f}')
             box.eye_label = state_text
 

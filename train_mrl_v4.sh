@@ -30,9 +30,14 @@ RESUME_LR="5e-5"
 # BACKBONE="repvgg_a0"
 # BACKBONE="repvgg_a2"
 BACKBONE="repvgg_b0"
+
+# 预下载权重目录（训练机离线时使用）
+# 提前在有网络的机器上把权重文件下载好，放到这个目录下
+# 文件名：{backbone_name}.pth 或 {backbone_name}.safetensors
+WEIGHTS_DIR="/ssddisk/guochuang/ocec/pretrained_weights"
 # ==============================
 
-OUTPUT_DIR="runs/ocec_mrl_v4"
+OUTPUT_DIR="runs/ocec_mrl_v4.1"
 
 RESUME_ARG=""
 if [ "$RESUME_FROM" = "auto" ]; then
@@ -83,6 +88,7 @@ export OCEC_ARGS="train \
     --enable_hard_negative_mining \
     --tb_port 6006 \
     --pretrained_backbone ${BACKBONE} \
+    --pretrained_weights_dir ${WEIGHTS_DIR} \
     ${RESUME_ARG}"
 
 LOG_FILE="logs/train/mrl/train_mrl_v4_$(date +%Y%m%d_%H%M%S).log"

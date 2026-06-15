@@ -32,9 +32,12 @@ RESUME_LR="5e-5"
 # BACKBONE="repvgg_a0"
 # BACKBONE="repvgg_a2"
 BACKBONE="repvgg_b0"
+
+# 预下载权重目录（训练机离线时使用）
+WEIGHTS_DIR="/ssddisk/guochuang/ocec/pretrained_weights"
 # ==============================
 
-OUTPUT_DIR="runs/ocec_combined_v4"
+OUTPUT_DIR="runs/ocec_combined_v4.1"
 
 RESUME_ARG=""
 if [ "$RESUME_FROM" = "auto" ]; then
@@ -97,6 +100,7 @@ export OCEC_ARGS="train \
     --enable_hard_negative_mining \
     --tb_port 6007 \
     --pretrained_backbone ${BACKBONE} \
+    --pretrained_weights_dir ${WEIGHTS_DIR} \
     ${RESUME_ARG}"
 
 LOG_FILE="logs/train/combined/train_combined_v4_$(date +%Y%m%d_%H%M%S).log"
