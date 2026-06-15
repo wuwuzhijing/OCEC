@@ -9,7 +9,8 @@
 #   - image_size: 64x64（匹配预训练 backbone 输入能力）
 #   - 参数量 ~1.5M（v2 自研 ~0.3M，v4 容量大且特征质量高）
 #
-# 可选 backbone: mobilenet_v4_small | efficientnet_b0 | resnet18
+# 可选 backbone (torchvision): mobilenet_v3_small | efficientnet_b0 | resnet18 | resnet34
+#              (timm): repvgg_a0 | repvgg_a1 | repvgg_a2 | repvgg_b0 | repvgg_b1 | repvgg_b2
 #
 # 续训: 设置 RESUME_FROM="auto" 或指定路径
 # ============================================================
@@ -21,9 +22,14 @@ RESUME_LR="5e-5"
 # ============================
 
 # ========== 模型配置 ==========
-BACKBONE="mobilenet_v4_small"
+# torchvision:
+# BACKBONE="mobilenet_v3_small"
 # BACKBONE="efficientnet_b0"
 # BACKBONE="resnet18"
+# timm:
+# BACKBONE="repvgg_a0"
+# BACKBONE="repvgg_a2"
+BACKBONE="repvgg_b0"
 # ==============================
 
 OUTPUT_DIR="runs/ocec_mrl_v4"
@@ -56,8 +62,8 @@ fi
 export OCEC_ARGS="train \
     --data_root /ssddisk/guochuang/ocec/MRL/mrl_eyes_2018/ \
     --output_dir ${OUTPUT_DIR} \
-    --epochs 300 \
-    --batch_size 256 \
+    --epochs 1000 \
+    --batch_size 512 \
     --num_workers 16 \
     --train_ratio 0.8 \
     --val_ratio 0.2 \

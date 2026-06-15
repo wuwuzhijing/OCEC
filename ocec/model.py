@@ -520,43 +520,53 @@ class OCEC(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def _build_pretrained_backbone(self, name: str):
-        """Load a torchvision pretrained backbone and return (features_module, out_channels)."""
-        try:
-            from torchvision import models
-        except ImportError:
-            raise ImportError("torchvision is required for pretrained backbones. Install with: pip install torchvision")
+        """Load a pretrained backbone and return (features_module, out_channels).
 
+        Supports torchvision models (mobilenet_v3_small, efficientnet_b0, resnet18,
+        resnet34) and timm models (repvgg_*, and any other timm model).
+        """
         print(f"Loading pretrained backbone: {name}")
 
-        if name == "mobilenet_v3_small":
-            model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
-            features = model.features  # output: 576 channels
-            out_channels = 576
-        elif name == "efficientnet_b0":
-            model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-            features = model.features  # output: 1280 channels
-            out_channels = 1280
-        elif name in ("resnet18", "resnet34"):
-            weight_cls = models.ResNet18_Weights if name == "resnet18" else models.ResNet34_Weights
-            model_cls = models.resnet18 if name == "resnet18" else models.resnet34
-            model = model_cls(weights=weight_cls.IMAGENET1K_V1)
-            # Strip avgpool and fc, keep conv layers only
-            features = nn.Sequential(
-                model.conv1,
-                model.bn1,
-                model.relu,
-                model.maxpool,
-                model.layer1,
-                model.layer2,
-                model.layer3,
-                model.layer4,
-            )
-            out_channels = 512
+        # ── torchvision backbones ──
+        _TV_MODELS = {
+            "mobilenet_v3_small": 576,
+            "efficientnet_b0": 1280,
+            "resnet18": 512,
+            "resnet34": 512,
+        }
+
+        if name in _TV_MODELS:
+            from torchvision import models
+
+            if name == "mobilenet_v3_small":
+                model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+                features = model.features
+            elif name == "efficientnet_b0":
+                model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+                features = model.features
+            elif name in ("resnet18", "resnet34"):
+                weight_cls = models.ResNet18_Weights if name == "resnet18" else models.ResNet34_Weights
+                model_cls = models.resnet18 if name == "resnet18" else models.resnet34
+                model = model_cls(weights=weight_cls.IMAGENET1K_V1)
+                features = nn.Sequential(
+                    model.conv1, model.bn1, model.relu, model.maxpool,
+                    model.layer1, model.layer2, model.layer3, model.layer4,
+                )
+            out_channels = _TV_MODELS[name]
+
         else:
-            raise ValueError(
-                f"Unsupported pretrained backbone: {name!r}. "
-                f"Supported: mobilenet_v3_small, efficientnet_b0, resnet18, resnet34"
-            )
+            # ── timm backbones (repvgg_*, etc.) ──
+            try:
+                import timm
+            except ImportError:
+                raise ImportError(
+                    f"timm is required for backbone '{name}'. Install with: pip install timm"
+                )
+
+            # num_classes=0 + global_pool='' → raw feature map output (no pooling, no classifier)
+            model = timm.create_model(name, pretrained=True, num_classes=0, global_pool='')
+            features = model
+            out_channels = model.num_features
 
         print(f"  Pretrained backbone loaded: {name} (output channels={out_channels})")
         return features, out_channels

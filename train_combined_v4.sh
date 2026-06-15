@@ -9,7 +9,8 @@
 #   - image_size: 64x64
 #   - 参数量 ~5.5M（含 head，远大于 v2 自研 ~0.3M）
 #
-# 可选 backbone: mobilenet_v4_small | efficientnet_b0 | resnet18
+# 可选 backbone (torchvision): mobilenet_v3_small | efficientnet_b0 | resnet18 | resnet34
+#              (timm): repvgg_a0 | repvgg_a1 | repvgg_a2 | repvgg_b0 | repvgg_b1 | repvgg_b2
 #
 # ⚠️  严格区分:
 #   - MRL v4:  train_mrl_v4.sh      → runs/ocec_mrl_v4/      port 6006
@@ -23,9 +24,14 @@ RESUME_LR="5e-5"
 # ============================
 
 # ========== 模型配置 ==========
-BACKBONE="mobilenet_v4_small"
+# torchvision:
+# BACKBONE="mobilenet_v3_small"
 # BACKBONE="efficientnet_b0"
 # BACKBONE="resnet18"
+# timm:
+# BACKBONE="repvgg_a0"
+# BACKBONE="repvgg_a2"
+BACKBONE="repvgg_b0"
 # ==============================
 
 OUTPUT_DIR="runs/ocec_combined_v4"
@@ -70,8 +76,8 @@ fi
 export OCEC_ARGS="train \
     --data_root /ssddisk/guochuang/ocec/MRL/ocec_combined/ \
     --output_dir ${OUTPUT_DIR} \
-    --epochs 300 \
-    --batch_size 256 \
+    --epochs 1000 \
+    --batch_size 512 \
     --num_workers 16 \
     --train_ratio 0.8 \
     --val_ratio 0.2 \
