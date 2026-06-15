@@ -867,6 +867,7 @@ class TrainConfig:
     unfreeze_all_f1_threshold: float = 0.85  # 全解冻触发的 F1 阈值
     neg_class_weight: float = 1.2  # 负类在 loss 中的权重（提升 precision）
     tb_port: int = 0  # TensorBoard 端口（0=自动扫描 6006-6009）
+    pretrained_backbone: str = ""  # ""=custom; "mobilenet_v3_small"|"efficientnet_b0"|"resnet18"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -2270,6 +2271,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         token_mixer_grid=config.token_mixer_grid,
         token_mixer_layers=config.token_mixer_layers,
         margin_method=config.margin_method,
+        pretrained_backbone=config.pretrained_backbone,
     )
     model = OCEC(model_config).to(device)
     
@@ -3873,6 +3875,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--pseudo_update_start_epoch", type=int, default=25, help="Delay pseudo-labeling until this epoch.")
     train_parser.add_argument("--neg_class_weight", type=float, default=1.2, help="Weight for negative class in loss (default: 1.2, higher = more focus on precision).")
     train_parser.add_argument("--tb_port", type=int, default=0, help="TensorBoard port (default: 0 = auto-scan 6006-6009).")
+    train_parser.add_argument("--pretrained_backbone", type=str, default="", help="Pretrained backbone: mobilenet_v3_small, efficientnet_b0, resnet18 (default: '' = custom).")
     train_parser.add_argument("--unfreeze_backbone_ratio", type=float, default=0.5, help="Ratio of backbone to unfreeze in Stage2 (default: 0.5 = last half).")
     train_parser.add_argument("--enable_hard_negative_mining", action="store_true", help="Enable hard negative mining (detect and log false positives).")
     train_parser.add_argument("--hard_neg_min_prob", type=float, default=0.7, help="Minimum probability threshold for hard negatives (default: 0.7).")
@@ -3990,6 +3993,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             unfreeze_all_after_resume=getattr(args, 'unfreeze_all_after_resume', False),
             unfreeze_all_f1_threshold=getattr(args, 'unfreeze_all_f1_threshold', 0.85),
             tb_port=getattr(args, 'tb_port', 0),
+            pretrained_backbone=getattr(args, 'pretrained_backbone', ''),
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

@@ -95,6 +95,7 @@ class ModelConfig:
     token_mixer_grid: tuple[int, int] = (2, 3)
     token_mixer_layers: int = 2
     margin_method: str = "cosface"  # "none", "arcface", "cosface"
+    pretrained_backbone: str = ""  # "" = custom; or "mobilenet_v3_small", "efficientnet_b0", "resnet18"
 
 
 class _SepConvBlock(nn.Module):
@@ -426,72 +427,83 @@ class OCEC(nn.Module):
         self._token_grid = self._ensure_token_grid(getattr(self.config, "token_mixer_grid", (3, 2)))
         self._token_layers = int(max(1, getattr(self.config, "token_mixer_layers", 2)))
 
-        if variant == "baseline":
-            stem_layers = [
-                nn.Conv2d(3, base, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(base),
-                nn.ReLU(inplace=True),
-            ]
-        elif variant == "inverted_se":
-            stem_layers = [
-                nn.Conv2d(3, base, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(base),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(base, base, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(base),
-                nn.SiLU(inplace=True),
-            ]
-        elif variant == "convnext":
-            stem_layers = [
-                nn.Conv2d(3, base, kernel_size=4, stride=4, padding=0, bias=True),
-                _LayerNorm2d(base),
-            ]
-        else:
-            raise ValueError(f"Unsupported architecture variant: {self.config.arch_variant}")
-        self._variant = variant
-        self.stem = nn.Sequential(*stem_layers)
+        pretrained = (self.config.pretrained_backbone or "").strip().lower()
+        self._is_pretrained = bool(pretrained)
 
-        channels = base
-        blocks = []
-        for idx in range(num_blocks):
-            stride = 2 if idx % 2 == 0 and idx > 0 else 1
-            next_channels = channels * (2 if stride == 2 else 1)
-            blocks.append(self._make_block(channels, next_channels, stride))
-            channels = next_channels
+        if self._is_pretrained:
+            # ── Pretrained backbone path ──
+            self._variant = "pretrained"
+            self.stem = nn.Identity()
+            self.features, channels = self._build_pretrained_backbone(pretrained)
+            self._feature_channels = channels
 
-        self.features = nn.Sequential(*blocks)
-        if self._head_variant in {"avg", "avgmax_mlp"}:
+            # Force simple avg head for pretrained backbone
+            self._head_variant = "avg"
             head_in_features = self._head_input_dim(channels)
             self.head = self._build_head(head_in_features)
-        elif self._head_variant in {"transformer", "mlp_mixer"}:
-            self.head = _TokenMixerHead(
-                channels,
-                dropout=self.config.dropout,
-                mixer_type=self._head_variant,
-                grid=self._token_grid,
-                layers=self._token_layers,
-            )
-        else:
-            raise ValueError(f"Unsupported head variant: {self._head_variant}")
-        self._feature_channels = channels
 
-        self._init_weights()
+            # Only init head/margin_head weights, NOT the pretrained backbone
+            self._init_head_weights()
+        else:
+            # ── Custom backbone path (original) ──
+            if variant == "baseline":
+                stem_layers = [
+                    nn.Conv2d(3, base, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(base),
+                    nn.ReLU(inplace=True),
+                ]
+            elif variant == "inverted_se":
+                stem_layers = [
+                    nn.Conv2d(3, base, kernel_size=3, stride=1, padding=1, bias=False),
+                    nn.BatchNorm2d(base),
+                    nn.SiLU(inplace=True),
+                    nn.Conv2d(base, base, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(base),
+                    nn.SiLU(inplace=True),
+                ]
+            elif variant == "convnext":
+                stem_layers = [
+                    nn.Conv2d(3, base, kernel_size=4, stride=4, padding=0, bias=True),
+                    _LayerNorm2d(base),
+                ]
+            else:
+                raise ValueError(f"Unsupported architecture variant: {self.config.arch_variant}")
+            self._variant = variant
+            self.stem = nn.Sequential(*stem_layers)
+
+            channels = base
+            blocks = []
+            for idx in range(num_blocks):
+                stride = 2 if idx % 2 == 0 and idx > 0 else 1
+                next_channels = channels * (2 if stride == 2 else 1)
+                blocks.append(self._make_block(channels, next_channels, stride))
+                channels = next_channels
+
+            self.features = nn.Sequential(*blocks)
+            self._feature_channels = channels
+
+            if self._head_variant in {"avg", "avgmax_mlp"}:
+                head_in_features = self._head_input_dim(channels)
+                self.head = self._build_head(head_in_features)
+            elif self._head_variant in {"transformer", "mlp_mixer"}:
+                self.head = _TokenMixerHead(
+                    channels,
+                    dropout=self.config.dropout,
+                    mixer_type=self._head_variant,
+                    grid=self._token_grid,
+                    layers=self._token_layers,
+                )
+            else:
+                raise ValueError(f"Unsupported head variant: {self._head_variant}")
+
+            self._init_weights()
+
+        # ── Margin head (shared) ──
         if self.config.margin_method in ["arcface", "cosface"]:
-            emb_dim = self._feature_channels   # transformer/mixer head 的 embedding dim
+            emb_dim = self._feature_channels
             if self.config.margin_method == "arcface":
-                # ArcFace: m=0.2 (角度间隔), s=8 (scale)
                 self.margin_head = ArcFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.2, s=8, s_val=4)
             elif self.config.margin_method == "cosface":
-                # CosFace: m=0.35 (余弦间隔), s=8 (scale)
-                # | 任务类型          | 推荐 margin       | 说明                  |
-                #| ------------- | --------------- | ------------------- |
-                #| 二分类（眼睛/气泡/声纹） | **0.20 ~ 0.35** | 太大容易造成训练“拒绝模糊样本”    |
-                #| 多分类 (>20类)    | 0.35 ~ 0.50     | 因为类间关系多，需要更强 margin |
-                # | embedding_dim | 推荐 s      |
-                #| ------------- | --------- |
-                #| 64–128        | **16–32** |
-                #| 32–64         | **8–20**  |
-                # 推理 scale 一般占训练 scale 的 30–50%
                 self.margin_head = CosFaceHead(embedding_dim=emb_dim, num_classes=2, m=0.18, s=12, s_val=6)
         else:
             self.margin_head = None
@@ -501,6 +513,60 @@ class OCEC(nn.Module):
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _build_pretrained_backbone(self, name: str):
+        """Load a torchvision pretrained backbone and return (features_module, out_channels)."""
+        try:
+            from torchvision import models
+        except ImportError:
+            raise ImportError("torchvision is required for pretrained backbones. Install with: pip install torchvision")
+
+        print(f"Loading pretrained backbone: {name}")
+
+        if name == "mobilenet_v3_small":
+            model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+            features = model.features  # output: 576 channels
+            out_channels = 576
+        elif name == "efficientnet_b0":
+            model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            features = model.features  # output: 1280 channels
+            out_channels = 1280
+        elif name in ("resnet18", "resnet34"):
+            weight_cls = models.ResNet18_Weights if name == "resnet18" else models.ResNet34_Weights
+            model_cls = models.resnet18 if name == "resnet18" else models.resnet34
+            model = model_cls(weights=weight_cls.IMAGENET1K_V1)
+            # Strip avgpool and fc, keep conv layers only
+            features = nn.Sequential(
+                model.conv1,
+                model.bn1,
+                model.relu,
+                model.maxpool,
+                model.layer1,
+                model.layer2,
+                model.layer3,
+                model.layer4,
+            )
+            out_channels = 512
+        else:
+            raise ValueError(
+                f"Unsupported pretrained backbone: {name!r}. "
+                f"Supported: mobilenet_v3_small, efficientnet_b0, resnet18, resnet34"
+            )
+
+        print(f"  Pretrained backbone loaded: {name} (output channels={out_channels})")
+        return features, out_channels
+
+    def _init_head_weights(self) -> None:
+        """Initialize ONLY head and margin_head weights (skip pretrained backbone)."""
+        for m in self.head.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
