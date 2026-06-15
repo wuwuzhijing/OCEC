@@ -7,6 +7,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _load_weight_file(path: str):
+    """Load a weight file in .pth, .pt, or .safetensors format."""
+    if path.endswith(".safetensors"):
+        try:
+            import safetensors.torch
+            return safetensors.torch.load_file(path, device="cpu")
+        except ImportError:
+            raise ImportError("safetensors is required to load .safetensors files. Install with: pip install safetensors")
+    else:
+        # .pth / .pt — try weights_only first, fall back if needed
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            print(f"  [warn] weights_only load failed for {path}, retrying with weights_only=False")
+            return torch.load(path, map_location="cpu", weights_only=False)
+
+
 class ArcFaceHead(nn.Module):
     """ArcFace: Additive Angular Margin Loss"""
     def __init__(self, embedding_dim, num_classes=2, s=30.0, s_val = 10.0, m=0.50):
@@ -615,8 +632,8 @@ class OCEC(nn.Module):
         for path in candidates:
             if os.path.isfile(path):
                 print(f"  Found: {path}")
-                state_dict = torch.load(path, map_location="cpu", weights_only=True)
-                # Handle wrapped state dicts (some repos wrap in 'model' or 'state_dict')
+                state_dict = _load_weight_file(path)
+                # Handle wrapped state dicts
                 if isinstance(state_dict, dict) and "state_dict" in state_dict:
                     state_dict = state_dict["state_dict"]
                 elif isinstance(state_dict, dict) and "model" in state_dict:
