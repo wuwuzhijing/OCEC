@@ -1,17 +1,19 @@
 #!/bin/bash
 # ============================================================
-# MRL Eye Dataset 独立训练 v3 (预训练 backbone)
+# 双数据集联合训练 v4 (预训练 backbone)
 # ============================================================
 #
-# v3 改进 (vs v2):
+# v4 改进 (vs v2):
 #   - 使用 torchvision 预训练 MobileNetV3-Small 替换自研小网络
 #   - ImageNet 预训练权重提供通用视觉特征，大幅提升跨 subject 泛化能力
-#   - image_size: 64x64（匹配预训练 backbone 输入能力）
-#   - 参数量 ~1.5M（v2 自研 ~0.3M，v3 容量大且特征质量高）
+#   - image_size: 64x64
+#   - 参数量 ~5.5M（含 head，远大于 v2 自研 ~0.3M）
 #
-# 可选 backbone: mobilenet_v3_small | efficientnet_b0 | resnet18
+# 可选 backbone: mobilenet_v4_small | efficientnet_b0 | resnet18
 #
-# 续训: 设置 RESUME_FROM="auto" 或指定路径
+# ⚠️  严格区分:
+#   - MRL v4:  train_mrl_v4.sh      → runs/ocec_mrl_v4/      port 6006
+#   - 联合 v4:  train_combined_v4.sh → runs/ocec_combined_v4/ port 6007
 # ============================================================
 
 # ========== 续训配置 ==========
@@ -21,12 +23,12 @@ RESUME_LR="5e-5"
 # ============================
 
 # ========== 模型配置 ==========
-BACKBONE="mobilenet_v3_small"
+BACKBONE="mobilenet_v4_small"
 # BACKBONE="efficientnet_b0"
 # BACKBONE="resnet18"
 # ==============================
 
-OUTPUT_DIR="runs/ocec_mrl_v3"
+OUTPUT_DIR="runs/ocec_combined_v4"
 
 RESUME_ARG=""
 if [ "$RESUME_FROM" = "auto" ]; then
@@ -53,8 +55,20 @@ if [ -n "$RESUME_ARG" ] && [ -n "$RESUME_LR" ]; then
     echo "✅ 续训学习率: ${TRAIN_LR}"
 fi
 
+# ---------- 确保合并数据存在 ----------
+COMBINED_PARQUET="/ssddisk/guochuang/ocec/MRL/ocec_combined/dataset.parquet"
+if [ ! -f "$COMBINED_PARQUET" ]; then
+    echo "合并数据集不存在，正在创建..."
+    python3 scripts/merge_datasets_to_parquet.py \
+        --existing data/dataset.parquet \
+        --mrl /ssddisk/guochuang/ocec/MRL/mrl_eyes_2018/dataset.parquet \
+        --output-dir /ssddisk/guochuang/ocec/MRL/ocec_combined
+    exit 1
+fi
+
+# ---------- 训练 ----------
 export OCEC_ARGS="train \
-    --data_root /ssddisk/guochuang/ocec/MRL/mrl_eyes_2018/ \
+    --data_root /ssddisk/guochuang/ocec/MRL/ocec_combined/ \
     --output_dir ${OUTPUT_DIR} \
     --epochs 300 \
     --batch_size 256 \
@@ -75,14 +89,14 @@ export OCEC_ARGS="train \
     --use_amp \
     --neg_class_weight 1.5 \
     --enable_hard_negative_mining \
-    --tb_port 6006 \
+    --tb_port 6007 \
     --pretrained_backbone ${BACKBONE} \
     ${RESUME_ARG}"
 
-LOG_FILE="logs/train/mrl/train_mrl_v3_$(date +%Y%m%d_%H%M%S).log"
-mkdir -p logs/train/mrl
+LOG_FILE="logs/train/combined/train_combined_v4_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p logs/train/combined
 
-nohup bash -c "source \$(conda info --base)/etc/profile.d/conda.sh && conda activate tf_310 && exec -a mrl_v3 python - << 'EOF'
+nohup bash -c "source \$(conda info --base)/etc/profile.d/conda.sh && conda activate tf_310 && exec -a combined_v4 python - << 'EOF'
 import os, shlex
 from ocec.__main__ import main
 args = shlex.split(os.environ['OCEC_ARGS'])
@@ -92,13 +106,13 @@ EOF" > ${LOG_FILE} 2>&1 &
 echo ""
 echo "============================================"
 if [ -n "$RESUME_ARG" ]; then
-    echo "  MRL v3 续训已启动 (resume)"
+    echo "  联合训练 v4 续训已启动 (resume)"
 else
-    echo "  MRL v3 独立训练已启动 (fresh)"
+    echo "  联合训练 v4 已启动 (fresh)"
 fi
 echo "============================================"
-echo "  v3 改进: pretrained ${BACKBONE} + 64x64"
-echo "  数据: /ssddisk/guochuang/ocec/MRL/mrl_eyes_2018/"
+echo "  v4 改进: pretrained ${BACKBONE} + 64x64"
+echo "  数据: /ssddisk/guochuang/ocec/MRL/ocec_combined/"
 echo "  输出: ${OUTPUT_DIR}"
 echo "  日志: ${LOG_FILE}"
 echo "  查看: tail -f ${LOG_FILE}"
