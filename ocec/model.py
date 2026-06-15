@@ -500,6 +500,12 @@ class OCEC(nn.Module):
             self._init_weights()
 
         # ── Margin head (shared) ──
+        # Embedding dropout: applies regularization directly to the feature
+        # vector before it enters the margin_head.  This is critical because
+        # when margin_head is active, self.head is bypassed and its dropout
+        # never affects the loss path.
+        self.embedding_dropout = nn.Dropout(self.config.dropout) if self.config.dropout > 0 else nn.Identity()
+
         if self.config.margin_method in ["arcface", "cosface"]:
             emb_dim = self._feature_channels
             if self.config.margin_method == "arcface":
@@ -554,6 +560,11 @@ class OCEC(nn.Module):
             elif name in ("resnet18", "resnet34"):
                 model_cls = models.resnet18 if name == "resnet18" else models.resnet34
                 model = model_cls(weights=None)
+                # Modified stem for small (64×64) eye ROI:
+                #   7×7 stride=2 → 3×3 stride=1 (keep more spatial detail)
+                #   maxpool → Identity (skip aggressive downsampling)
+                model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                model.maxpool = nn.Identity()
                 features = nn.Sequential(
                     model.conv1, model.bn1, model.relu, model.maxpool,
                     model.layer1, model.layer2, model.layer3, model.layer4,
@@ -663,13 +674,14 @@ class OCEC(nn.Module):
             use_margin = (training is not None and training) or (training is None and self.training)
 
             if use_margin:
-                # Training: apply margin warmup
-                logits_margin = self.margin_head(embedding, labels=labels, epoch=epoch)
+                # Training: apply embedding dropout, then margin warmup
+                emb = self.embedding_dropout(embedding)
+                logits_margin = self.margin_head(emb, labels=labels, epoch=epoch)
                 if return_embedding:
                     return logits_margin, embedding
                 return logits_margin
             else:
-                # Eval/inference → No margin but scaled logits
+                # Eval/inference → No margin, no dropout, scaled logits
                 logits_no_margin = self.margin_head(embedding, labels=None)
                 if return_embedding:
                     return logits_no_margin, embedding
@@ -681,7 +693,15 @@ class OCEC(nn.Module):
         return logits
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.forward(x))
+        """Return P(open) probability.
+
+        When margin_head is active (CosFace/ArcFace), forward returns (B,2) logits
+        and we must use softmax, not sigmoid.  P(open) = softmax(logits)[:, 1].
+        """
+        logits = self.forward(x)
+        if self.margin_head is not None and logits.ndim == 2 and logits.size(1) == 2:
+            return torch.softmax(logits, dim=1)[:, 1]
+        return torch.sigmoid(logits)
 
     def _make_block(self, in_channels: int, out_channels: int, stride: int) -> nn.Module:
         if self._variant == "baseline":
