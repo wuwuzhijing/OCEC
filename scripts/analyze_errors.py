@@ -35,7 +35,6 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-# Import OCEC
 import torch
 from torch.utils.data import DataLoader
 
