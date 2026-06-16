@@ -3766,7 +3766,9 @@ def export_to_onnx(
     device = _resolve_device(device_spec)
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    model_config = ModelConfig(**checkpoint["model_config"])
+    model_config_dict = checkpoint["model_config"]
+    model_config_dict["pretrained_weights_dir"] = ""  # checkpoint has full state dict
+    model_config = ModelConfig(**model_config_dict)
     model = OCEC(model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
