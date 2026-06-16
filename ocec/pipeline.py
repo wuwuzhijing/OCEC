@@ -3817,10 +3817,11 @@ def export_to_onnx(
             # 恢复原始状态
             self.base_model.config.margin_method = original_margin_method
             
-            # Use Slice (not Gather) for ONNX/OpenCV compatibility
-            # logits[:, 1:2] → Slice; logits[:, 1] → Gather (broken in OpenCV DNN)
+            # Binary logit: z_closed - z_open → sigmoid gives P(closed)
+            # This matches the PyTorch inference path (softmax on 2-class logits)
             if logits.ndim == 2 and logits.shape[1] == 2:
-                logits = logits[:, 1:2]  # (B, 1)
+                logit_closed = logits[:, 0:1] - logits[:, 1:2]  # (B, 1)
+                return torch.sigmoid(logit_closed)
             elif logits.ndim == 2 and logits.shape[1] == 1:
                 logits = logits
             return torch.sigmoid(logits)
