@@ -788,33 +788,33 @@ def _remove_batchnorm_from_onnx(model):
         additional_initializers.append(alpha_init)
         additional_initializers.append(beta_init)
 
-        # Reshape alpha [C] → [1, C, 1, 1] for OpenCV DNN compatibility
-        reshape_node = helper.make_node(
-            "Reshape",
-            [alpha_name],
-            [alpha_reshaped_name],
-            name=f"{node.name}_AlphaReshape" if node.name else "",
+        # Reshape alpha, beta [C] → [1, C, 1, 1] for OpenCV DNN compatibility
+        alpha_rs = f"{node.output[0]}_bn_alpha_rs"
+        beta_rs = f"{node.output[0]}_bn_beta_rs"
+
+        reshape_alpha = helper.make_node(
+            "Reshape", [alpha_name], [alpha_rs],
+            name=f"{node.name}_AReshape" if node.name else "",
         )
-        reshape_init = numpy_helper.from_array(
-            np.array([1, len(alpha), 1, 1], dtype=np.int64),
-            name=f"{alpha_reshaped_name}_shape",
+        reshape_beta = helper.make_node(
+            "Reshape", [beta_name], [beta_rs],
+            name=f"{node.name}_BReshape" if node.name else "",
         )
-        additional_initializers.append(reshape_init)
-        # Connect reshape_node's shape input
-        reshape_node.input.append(f"{alpha_reshaped_name}_shape")
+        shape_val = np.array([1, len(alpha), 1, 1], dtype=np.int64)
+        rs_shape_alpha = numpy_helper.from_array(shape_val, name=f"{alpha_rs}_shape")
+        rs_shape_beta = numpy_helper.from_array(shape_val, name=f"{beta_rs}_shape")
+        additional_initializers.extend([rs_shape_alpha, rs_shape_beta])
+        reshape_alpha.input.append(rs_shape_alpha.name)
+        reshape_beta.input.append(rs_shape_beta.name)
 
         mul_out = f"{node.output[0]}_mul"
         mul_node = helper.make_node(
-            "Mul",
-            [inputs[0], alpha_reshaped_name],
-            [mul_out],
+            "Mul", [inputs[0], alpha_rs], [mul_out],
             name=f"{node.name}_Mul" if node.name else "",
         )
-        new_nodes.append(reshape_node)
+        new_nodes.extend([reshape_alpha, reshape_beta])
         add_node = helper.make_node(
-            "Add",
-            [mul_out, beta_name],
-            [node.output[0]],
+            "Add", [mul_out, beta_rs], [node.output[0]],
             name=f"{node.name}_Add" if node.name else "",
         )
         new_nodes.extend([mul_node, add_node])
