@@ -19,10 +19,11 @@ WEIGHTS_DIR="/ssddisk/guochuang/ocec/pretrained_weights"
 OUTPUT_DIR="runs/ocec_mrl_v4.3_fatigue"
 
 # 1. Convert fatigue dataset
+FATIGUE_DATA_ROOT="/103/gupengli/dataset/fatigue_dataset"
 FATIGUE_PARQUET="/ssddisk/guochuang/ocec/fatigue_dataset/dataset.parquet"
 if [ ! -f "$FATIGUE_PARQUET" ]; then
     echo "=== Step 1: Convert fatigue → parquet ==="
-    python3 "${SCRIPT_DIR}/scripts/convert_fatigue_to_parquet.py"
+    python3 "${SCRIPT_DIR}/scripts/convert_fatigue_to_parquet.py" --data-root "${FATIGUE_DATA_ROOT}"
     [ $? -ne 0 ] && echo "❌ fatigue conversion failed" && exit 1
 fi
 

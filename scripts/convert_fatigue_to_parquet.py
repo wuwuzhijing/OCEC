@@ -89,27 +89,33 @@ def embed_image_bytes(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src-dataset", type=Path,
-                        default=Path("/home/shares/gupengli/dataset/fatigue_dataset/src_dataset"),
-                        help="src_dataset root (2-class)")
-    parser.add_argument("--L2-dataset", type=Path,
-                        default=Path("/home/shares/gupengli/dataset/fatigue_dataset/L2+_dataset"),
-                        help="L2+ dataset root (3-class)")
-    parser.add_argument("--futian-dataset", type=Path, default=None,
-                        help="futian_dataset root (optional)")
+    parser.add_argument("--data-root", type=Path, default=None,
+                        help="Fatigue dataset root dir (contains src_dataset/, L2+_dataset/, etc.)")
+    parser.add_argument("--src-dataset", type=Path, default=None)
+    parser.add_argument("--L2-dataset", type=Path, default=None)
+    parser.add_argument("--futian-dataset", type=Path, default=None)
     parser.add_argument("--output", type=Path,
                         default=Path("/ssddisk/guochuang/ocec/fatigue_dataset"),
                         help="Output directory for parquet")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    roots = [args.src_dataset, args.L2_dataset]
-    if args.futian_dataset:
-        roots.append(args.futian_dataset)
+    # Resolve dataset paths
+    if args.data_root:
+        base = args.data_root
+        args.src_dataset = args.src_dataset or base / "src_dataset"
+        args.L2_dataset = args.L2_dataset or base / "L2+_dataset"
+        args.futian_dataset = args.futian_dataset or base / "futian_dataset"
+
+    roots = [p for p in [args.src_dataset, args.L2_dataset, args.futian_dataset] if p is not None]
 
     print("Collecting fatigue samples...")
     samples = collect_fatigue_samples(roots)
     print(f"Total: {len(samples)} samples")
+
+    if len(samples) == 0:
+        print("ERROR: No samples found! Check dataset paths.")
+        return
 
     for label in ["open", "closed"]:
         cnt = sum(1 for s in samples if s["label"] == label)
