@@ -3817,15 +3817,12 @@ def export_to_onnx(
             # 恢复原始状态
             self.base_model.config.margin_method = original_margin_method
             
-            # 处理不同形状的 logits
+            # Use Slice (not Gather) for ONNX/OpenCV compatibility
+            # logits[:, 1:2] → Slice; logits[:, 1] → Gather (broken in OpenCV DNN)
             if logits.ndim == 2 and logits.shape[1] == 2:
-                # 如果是 [B, 2] 形状（不应该发生，但为了安全），取正类 logit
-                logits = logits[:, 1]
+                logits = logits[:, 1:2]  # (B, 1)
             elif logits.ndim == 2 and logits.shape[1] == 1:
-                # 如果是 [B, 1]，squeeze 成 [B]
-                logits = logits.squeeze(1)
-            
-            # 对单个 logit 应用 sigmoid 得到概率
+                logits = logits
             return torch.sigmoid(logits)
 
     export_base = copy.deepcopy(model)
