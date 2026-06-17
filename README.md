@@ -272,6 +272,47 @@ If you find this project useful, please consider citing:
 }
 ```
 
+## Training Diagnostics
+
+训练过程中自动生成以下诊断文件（在 `output_dir` 下）：
+
+```
+runs/<experiment>/v<N>/
+├── diagnostics/
+│   └── val/
+│       ├── confusion_val_epochXXXX.png    # 混淆矩阵 (TP/TN/FP/FN)
+│       └── roc_val_epochXXXX.png          # ROC 曲线 + AUC
+├── hard_negatives.csv                     # 高置信 FP (prob≥0.7, 误报风险)
+├── hard_samples.csv                       # 难例 (prob 靠近 0.5)
+├── mislabeled.csv                         # 疑似错标样本
+└── outliers.csv                           # 离群点 (Mahalanobis 距离)
+```
+
+**FP/FN 样本可视化**（训练完成后手动运行）：
+
+```bash
+python scripts/analyze_errors.py \
+    --checkpoint runs/<exp>/v1/ocec_best_epochXXXX_f1_XXXX.pt \
+    --data /path/to/dataset/ \
+    --output output/error_analysis \
+    --top-k 50
+```
+
+输出：
+- `score_distribution.png` — 正/负样本 Score 直方图 + FP/FN 分布 + KS 距离
+- `fp_high_conf.png` — 高置信 FP 蒙太奇（prob≥0.7，DMS 核心风险）
+- `fp_all.png` / `fn_all.png` — 全部 FP/FN 蒙太奇
+
+**ONNX 导出**：
+
+```bash
+# 自动找 F1 最高的 checkpoint 导出
+bash scripts/export_best_onnx.sh runs/<experiment>
+
+# 显式指定 checkpoint
+bash scripts/export_best_onnx.sh runs/<exp>/v1/ocec_best_epochXXXX_f1_XXXX.pt
+```
+
 ## Acknowledgements
 - https://huggingface.co/datasets/MichalMlodawski/closed-open-eyes: Open Data Commons Attribution License (ODC-By) v1.0
   ```bibtex
