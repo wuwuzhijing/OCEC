@@ -57,16 +57,10 @@ echo "  Output:     $OUTPUT_ONNX"
 echo "============================================"
 
 cd "$PROJECT_DIR"
-# Try local weights dir if it exists
-WEIGHTS_DIR="/ssddisk/guochuang/ocec/pretrained_weights"
-EXTRA=""
-[ -d "$WEIGHTS_DIR" ] && EXTRA="--pretrained_weights_dir $WEIGHTS_DIR"
-
 python -m ocec exportonnx \
     --checkpoint "$BEST_CKPT" \
     --output "$OUTPUT_ONNX" \
-    --opset 17 \
-    $EXTRA
+    --opset 17
 
 echo ""
 echo "Done: $OUTPUT_ONNX"
