@@ -57,6 +57,7 @@ echo "  Output:     $OUTPUT_ONNX"
 echo "============================================"
 
 cd "$PROJECT_DIR"
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 python -m ocec exportonnx \
     --checkpoint "$BEST_CKPT" \
     --output "$OUTPUT_ONNX" \
