@@ -740,6 +740,34 @@ def _decompose_batchnorms(module: nn.Module) -> None:
             _decompose_batchnorms(child)
 
 
+def _remove_abs_from_onnx(model):
+    """Replace Abs(x) with Relu(x) + Relu(-x) for OpenCV DNN compatibility."""
+    from onnx import helper, numpy_helper
+    import numpy as np
+
+    graph = model.graph
+    new_nodes = []
+    for node in graph.node:
+        if node.op_type != "Abs":
+            new_nodes.append(node)
+            continue
+        # Abs(x) = Relu(x) + Relu(-x)
+        neg_out = f"{node.output[0]}_neg"
+        relu_out = f"{node.output[0]}_relu"
+        relu_neg_out = f"{node.output[0]}_relu_neg"
+
+        neg_node = helper.make_node("Neg", [node.input[0]], [neg_out], name=f"{node.name}_Neg")
+        relu_node = helper.make_node("Relu", [node.input[0]], [relu_out], name=f"{node.name}_Relu")
+        relu_neg_node = helper.make_node("Relu", [neg_out], [relu_neg_out], name=f"{node.name}_ReluNeg")
+        add_node = helper.make_node("Add", [relu_out, relu_neg_out], [node.output[0]], name=f"{node.name}_Add")
+
+        new_nodes.extend([neg_node, relu_node, relu_neg_node, add_node])
+
+    graph.ClearField("node")
+    graph.node.extend(new_nodes)
+    return model
+
+
 def _remove_batchnorm_from_onnx(model):
     from onnx import helper, numpy_helper
 
@@ -3852,6 +3880,7 @@ def export_to_onnx(
         simplified_model, check = simplify(onnx_model)
         if check:
             simplified_model = _remove_batchnorm_from_onnx(simplified_model)
+            simplified_model = _remove_abs_from_onnx(simplified_model)
             onnx.save(simplified_model, output_path)
             LOGGER.info("Simplified ONNX model with onnxsim at %s", output_path)
         else:
