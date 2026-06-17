@@ -588,10 +588,13 @@ class OCEC(nn.Module):
                 )
             out_channels = _TV_MODELS[name]
 
-            # Load weights from local dir if provided
+            # Load weights from local dir if provided; otherwise checkpoint state dict fills them
             if weights_dir:
-                self._load_weights_from_dir(features if not isinstance(features, nn.Sequential) or name not in ("resnet18", "resnet34") else model, name, weights_dir)
+                target = model if name in ("resnet18", "resnet34") else features
+                self._load_weights_from_dir(target, name, weights_dir)
                 print(f"  Loaded local weights for: {name}")
+            else:
+                print(f"  Created {name} without pretrained weights (will load from checkpoint)")
 
         else:
             # ── timm backbones (repvgg_*, etc.) ──
@@ -603,13 +606,14 @@ class OCEC(nn.Module):
                 )
 
             if weights_dir:
-                # Create model without pretrained, load local weights
                 model = timm.create_model(name, pretrained=False, num_classes=0, global_pool='')
                 self._load_weights_from_dir(model, name, weights_dir)
                 print(f"  Loaded local weights for: {name}")
             else:
-                # Auto-download from huggingface
-                model = timm.create_model(name, pretrained=True, num_classes=0, global_pool='')
+                # No local weights dir: create without pretrained.
+                # (checkpoint state dict will fill weights via load_state_dict later)
+                model = timm.create_model(name, pretrained=False, num_classes=0, global_pool='')
+                print(f"  Created {name} without pretrained weights (will load from checkpoint)")
 
             features = model
             out_channels = model.num_features
