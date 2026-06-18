@@ -96,7 +96,7 @@ export OCEC_ARGS="train \
     --use_amp \
     --neg_class_weight 1.5 \
     --enable_hard_negative_mining \
-    --tb_port 6013 \
+    --tb_port 6021 \
     --pretrained_backbone ${BACKBONE} \
     --pretrained_weights_dir ${WEIGHTS_DIR} \
     ${RESUME_ARG}"
